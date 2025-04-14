@@ -1,1343 +1,1909 @@
+
 import os
 import time
 import logging
-import pickle
-import datetime
 import threading
-import gc
-import ccxt
+import json
 import queue
-import numpy as _np
-_np.NaN = _np.nan
-import numpy as np
+import ccxt # Still needed for exchange interaction (orders, initial fetch, OI)
 import pandas as pd
-import pandas_ta as ta
-from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from ccxt.base.errors import RequestTimeout, ExchangeError
-from sklearn.preprocessing import RobustScaler
-from sklearn.model_selection import train_test_split
-import tensorflow as tf
-from tensorflow.keras import backend as K
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import Conv1D, MaxPooling1D, BatchNormalization, LSTM, Dense, Dropout, Bidirectional, Attention, Add, Input
-from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
-from queue import Queue  # <-- Import Queue for our training tasks
-from scipy import stats
+import numpy as np
+from collections import defaultdict, deque, Counter
+from OrderBookOIScalpingIndicator import EnhancedOrderBookVolumeWrapper # Assuming this file exists and is compatible
+import asyncio
+import sys # Import sys to check the platform
+# Import python-binance
+from binance import ThreadedWebsocketManager, Client # Use Client for REST calls
 
-from dotenv import load_dotenv
+# Configuration
+SLEEP_INTERVAL = 2  # seconds - Main loop check interval (much shorter now)
+MAX_OPEN_TRADES = 3
+AMOUNT_USD = 1
+TIMEFRAME = '3m' # Kline interval for websockets
+LIMIT = 100 # History length for indicators
+LEVERAGE_OPTIONS = [30, 25, 15, 8]
+WEBSOCKET_DEPTH_LEVELS = 20 # Order book depth
+WEBSOCKET_UPDATE_SPEED = '1000ms' # Or '100ms' for faster updates, more resource intensive
 
-load_dotenv()  # Load environment variables from .env file
-# ------------------ Global Parameters and Globals ------------------
+# Anti-cycling settings
+MINIMUM_HOLD_MINUTES = 2
+SYMBOL_COOLDOWN_MINUTES = 15
 
-AMOUNT_USD = 2
-MAX_OPEN_TRADES = 2
-WINDOW_SIZE = 5
-TIMEFRAME = '3m'
-LIMIT = 300
-THRESHOLD = 0.005  # Lowered from 0.005 to 0.2% minimum threshold
-PREDICTION_HORIZON = 3  # Reduced from 5 for more responsive signals
-SLEEP_INTERVAL = 20
+# --- WebSocket Data Storage ---
+# Use dictionaries protected by locks to store the latest data from websockets
+latest_kline_data = {}      # {symbol: deque(maxlen=LIMIT+10)} # Store raw kline list/dict
+latest_depth_data = {}      # {symbol: {'bids': {price: qty}, 'asks': {price: qty}, 'lastUpdateId': id}}
+latest_ticker_data = {}     # {symbol: ticker_dict}
+last_ws_update_time = {}    # {symbol: timestamp} # Track freshness
 
-PERFORMANCE_CHECK_INTERVAL = 10
-ERROR_THRESHOLD = 0.01
+kline_lock = threading.Lock()
+depth_lock = threading.Lock()
+ticker_lock = threading.Lock()
+ws_update_time_lock = threading.Lock()
+monitored_symbols = set()
+# ----------------------------
 
-NUM_MC_SAMPLES = 5
-FIXED_THRESHOLD = 0.01
+# Thread synchronization (existing)
+symbol_cooldowns = {}
+position_entry_times = {}
+cooldown_lock = threading.Lock()
+consecutive_stop_losses = {}
+consecutive_stop_loss_lock = threading.Lock()
+position_details = {}
+position_details_lock = threading.Lock()
 
-DEFAULT_MODEL_PARAMS = {
-    'lstm_units1': 64,    # Increased from 50 for better feature extraction
-    'lstm_units2': 32,    # Increased from 25
-    'lstm_units3': 16,    # New layer for deeper temporal processing
-    'dropout_rate': 0.3,
-    'attention_heads': 4  # New parameter for multi-head attention
+# Global metrics (existing)
+global_metrics = {
+    'patterns_detected': 0, 'patterns_below_threshold': 0, 'insufficient_tf_confirmation': 0,
+    'failed_sequence_check': 0, 'failed_reversal_check': 0, 'failed_risk_reward': 0,
+    'failed_proximity_check': 0, 'order_placement_errors': 0, 'successful_entries': 0,
+    'last_reset': time.time()
 }
 
-# Instead of global baap_model/scaler, we use per-market dictionaries.
-market_models = {}      # key: market_id, value: model
-market_scalers = {}     # key: market_id, value: scaler
-market_model_params = {}  # key: market_id, value: model parameters
-market_locks = {}  # Add this at the global scope
-# Add these at the top of the file, after imports and before other global parameters
-market_leverages = {}  # Dictionary to store leverage per market_id
-leverage_options = [20, 10,8]  # List of leverage values to try
-# This file now stores a dict with keys: 'completed_markets' (list) and 'historical_training_completed' (bool)
-BAAP_TRAINED_FLAG_FILENAME = "baap_model_trained_flag.pkl"
+# Logger setup (existing)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-historical_training_completed = False
+# Directories (existing)
+PARAMS_DIR = 'optimized_params'
+os.makedirs(PARAMS_DIR, exist_ok=True)
+TRADE_LOG_DIR = 'trade_logs'
+os.makedirs(TRADE_LOG_DIR, exist_ok=True)
+PATTERN_STATS_DIR = 'pattern_stats'
+os.makedirs(PATTERN_STATS_DIR, exist_ok=True)
 
-# Conditional decorator based on TensorFlow version
-if hasattr(tf.keras, 'saving'):
-    register_decorator = tf.keras.saving.register_keras_serializable(package="CustomLayers")
-else:
-    register_decorator = tf.keras.utils.register_keras_serializable(package="CustomLayers")
+# OHLCV cache is no longer needed for primary data, keep for potential fallbacks or OI polling context
+ohlcv_cache = defaultdict(lambda: {'data': None, 'timestamp': 0})
+CACHE_TTL = 60 # Reduced TTL as it's less critical now
+cache_lock = threading.Lock()
 
-@register_decorator
-class LearnableBiasedAttention(Attention):
-    def __init__(self, sequence_length, **kwargs):
-        super(LearnableBiasedAttention, self).__init__(**kwargs)
-        self.sequence_length = sequence_length
-        self.bias = self.add_weight(
-            shape=(sequence_length,),
-            initializer='zeros',
-            trainable=True,
-            name='attention_bias'
-        )
+# Indicator instances (existing)
+symbol_indicators = {}
+indicator_lock = threading.Lock()
 
-    def _calculate_scores(self, query, key):
-        scores = super(LearnableBiasedAttention, self)._calculate_scores(query, key)
-        bias = tf.expand_dims(self.bias, axis=0)
-        scores += bias
-        return scores
+# Default parameters (existing) - Update potentially if indicator changes
+DEFAULT_PARAMS = {
+    'ob_depth': WEBSOCKET_DEPTH_LEVELS, # Align with WS depth
+    'ob_update_interval': 1.0 if WEBSOCKET_UPDATE_SPEED == '1000ms' else 0.1, # Align with WS speed
+    'min_wall_size': 20, 'imbalance_threshold': 1.8,
+    'oi_window': 24, 'oi_change_threshold': 1.0,
+    'atr_window': 3, 'vol_multiplier': 1.2, 'min_vol': 0.0005,
+    'risk_reward_ratio': 1.5, 'profit_target_pct': 0.3, 'stop_loss_pct': 0.2,
+    'liquidation_oi_threshold': 15.0
+}
 
-    def get_config(self):
-        config = super(LearnableBiasedAttention, self).get_config()
-        config.update({'sequence_length': self.sequence_length})
-        return config
-# ------------------ Helper Functions for Unique Filenames ------------------
-def set_leverage_with_fallback(exchange, market_id, leverage_options):
-    """Attempts to set leverage for a market_id, starting with the highest value and falling back."""
-    for leverage in leverage_options:
-        try:
-            exchange.set_leverage(leverage, market_id)
-            logging.info(f"Successfully set leverage to {leverage} for {market_id}")
-            return leverage
-        except Exception as e:
-            logging.warning(f"Failed to set leverage to {leverage} for {market_id}: {e}")
-    logging.error(f"Failed to set any leverage for {market_id}")
-    return None
-def get_leverage_for_market(exchange, market_id):
-    """Retrieves or sets the leverage for a market_id."""
-    if market_id in market_leverages:
-        return market_leverages[market_id]  # Use stored leverage if available
-    else:
-        leverage = set_leverage_with_fallback(exchange, market_id, leverage_options)
-        if leverage is not None:
-            market_leverages[market_id] = leverage  # Store successful leverage
-        return leverage
-def get_model_filename(market_id):
-    return f"model_{market_id}_ws{WINDOW_SIZE}.keras"
+# File writer queue (existing)
+file_update_queue = queue.Queue()
+file_writer_stop_event = threading.Event()
 
-def get_scaler_filename(market_id):
-    return f"scaler_{market_id}_ws{WINDOW_SIZE}.pkl"
+# --- WebSocket Callback Functions ---
 
-def get_historic_csv_filename(market_id):
-    return f"{market_id}_historic.csv"
-
-# ------------------ Training Queue Setup ------------------
-# Create a queue with a maxsize of 1 to avoid duplicate training tasks.
-# Global variables
-# training_queue = queue.Queue(maxsize=5)
-historical_training_queue = queue.Queue(maxsize=5)  # For initial historical training
-retraining_queue = queue.Queue(maxsize=5)          # For periodic retraining
-training_in_progress = set()                        # Shared set to track ongoing training
-training_lock = threading.Lock()                    # Ensures thread-safe access to the set
-
-
-
-
-def self_improve_model_hyperopt(current_model, X, y, scaler, current_params):
-    """
-    Automated hyperparameter tuning using Hyperopt for the LSTM model.
-    Splits the provided data, defines an objective function for Hyperopt,
-    and returns the best model and parameters found.
-    """
-    logging.info("Starting automated hyperparameter tuning with Hyperopt for LSTM model")
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
-    input_shape = X.shape[1:]  # (window_size, num_features)
-    
-    def objective(params):
-        # Clear TensorFlow state to prevent session/graph corruption
-        tf.keras.backend.clear_session()
-        tf.compat.v1.reset_default_graph()
-        
-        # Build a candidate model with sampled hyperparameters
-        trial_params = {
-            "lstm_units1": int(params["lstm_units1"]),
-            "lstm_units2": int(params["lstm_units2"]),
-            "lstm_units3": int(params["lstm_units3"]),
-            "dropout_rate": params["dropout_rate"]
-        }
-        learning_rate = params["learning_rate"]
-        epochs = int(params["epochs"])
-        
-        model = build_model_with_params(trial_params, input_shape, sequence_length=WINDOW_SIZE)
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-                      loss='mse', metrics=['mae'])
-        
-        callbacks = [EarlyStopping(monitor='val_loss', patience=3, min_delta=1e-4,
-                                   restore_best_weights=True, verbose=0)]
-        model.fit(X_train, y_train, validation_data=(X_val, y_val),
-                  epochs=epochs, batch_size=32, verbose=0, callbacks=callbacks)
-        # Return validation loss
-        val_loss = model.evaluate(X_val, y_val, verbose=0)[0]
-        return {'loss': val_loss, 'status': STATUS_OK}
-    
-    # Define hyperparameter search space
-    space = {
-        "lstm_units1": hp.quniform("lstm_units1", 32, 128, 16),
-        "lstm_units2": hp.quniform("lstm_units2", 16, 64, 8),
-        "lstm_units3": hp.quniform("lstm_units3", 16, 32, 8),
-        "dropout_rate": hp.uniform("dropout_rate", 0.1, 0.5),
-        "learning_rate": hp.loguniform("learning_rate", np.log(1e-4), np.log(1e-2)),
-        "epochs": hp.quniform("epochs", 5, 15, 1)
-    }
-    
-    trials = Trials()
-    best = fmin(fn=objective, space=space, algo=tpe.suggest, max_evals=10, trials=trials)
-    # Convert best values to appropriate types
-    best_params = {
-        "lstm_units1": int(best["lstm_units1"]),
-        "lstm_units2": int(best["lstm_units2"]),
-        "lstm_units3": int(best["lstm_units3"]),
-        "dropout_rate": best["dropout_rate"],
-        "learning_rate": best["learning_rate"],
-        "epochs": int(best["epochs"])
-    }
-    logging.info(f"Hyperopt found best parameters: {best_params}")
-    
-    # Clear state again before building the final model
-    tf.keras.backend.clear_session()
-    tf.compat.v1.reset_default_graph()
-    
-    # Rebuild the best model with the best hyperparameters
-    best_model = build_model_with_params(best_params, input_shape, sequence_length=WINDOW_SIZE)
-    best_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params["learning_rate"]),
-                       loss='mse', metrics=['mae'])
-    best_model.fit(X_train, y_train, validation_data=(X_val, y_val),
-                   epochs=10, batch_size=32, verbose=0, callbacks=[
-                       EarlyStopping(monitor="val_loss", patience=3, min_delta=1e-4,
-                                     restore_best_weights=True, verbose=0)
-                   ])
-    return best_model, best_params
-
-def historical_training_worker():
-    """Worker thread that processes historical training tasks."""
-    while True:
-        try:
-            task = historical_training_queue.get()
-            if task is None:  # Shutdown signal
-                break
-            market_id = task['market_id']
-            historic_csv = get_historic_csv_filename(market_id)
-            if not os.path.exists(historic_csv):
-                logging.warning(f"No historical data for {market_id}. Skipping.")
-                historical_training_queue.task_done()
-                continue
-            df_market = pd.read_csv(historic_csv)
-            df_market['timestamp'] = pd.to_datetime(df_market['timestamp'])
-            X, y, scaler = preprocess_data(df_market, window_size=WINDOW_SIZE, fit_scaler=True)
-            if X.size == 0:
-                logging.warning(f"Not enough data for {market_id}. Skipping.")
-                historical_training_queue.task_done()
-                continue
-
-            input_shape = (X.shape[1], X.shape[2])
-            model = build_model(input_shape, sequence_length=WINDOW_SIZE, model_params=DEFAULT_MODEL_PARAMS)
-            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
-            callbacks = [
-                ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6, verbose=1),
-                EarlyStopping(monitor='val_loss', patience=3, min_delta=1e-4, verbose=1)
-            ]
-            logging.info(f"Starting historical training for {market_id}...")
-            model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=10, callbacks=callbacks, verbose=1)
-            model.save(get_model_filename(market_id))
-            with open(get_scaler_filename(market_id), 'wb') as f:
-                pickle.dump(scaler, f)
-            market_models[market_id] = model
-            market_scalers[market_id] = scaler
-            logging.info(f"Historical training completed for {market_id}")
-
-            with training_lock:
-                training_in_progress.remove(market_id)
-            historical_training_queue.task_done()
-        except Exception as e:
-            logging.exception(f"Error in historical training worker for task {task}: {e}")
-            with training_lock:
-                if market_id in training_in_progress:
-                    training_in_progress.discard(market_id)
-            historical_training_queue.task_done()
-
-# Updated training_worker function using Hyperopt for live retraining:
-def retraining_worker():
-    """Worker thread that processes retraining tasks with live data."""
-    while True:
-        try:
-            task = retraining_queue.get()
-            if task is None:  # Shutdown signal
-                break
-            market_id = task['market_id']
-            X_live = task['X']
-            y_live = task['y']
-            scaler_live = task['scaler']
-            if market_id not in market_models:
-                logging.warning(f"Model for {market_id} not found. Cannot retrain.")
-                retraining_queue.task_done()
-                continue
-            current_model = market_models[market_id]
-            current_params = market_model_params.get(market_id, DEFAULT_MODEL_PARAMS.copy())
-            
-            # Perform retraining with Hyperopt
-            improved_model, best_params = self_improve_model_hyperopt(current_model, X_live, y_live, scaler_live, current_params)
-            
-            # Update global dictionaries
-            market_models[market_id] = improved_model
-            market_model_params[market_id] = best_params
-            logging.info(f"Retraining with Hyperopt tuning completed for {market_id}")
-
-            with training_lock:
-                training_in_progress.remove(market_id)
-            retraining_queue.task_done()
-        except Exception as e:
-            logging.exception(f"Error in retraining worker for task {task}: {e}")
-            with training_lock:
-                if market_id in training_in_progress:
-                    training_in_progress.discard(market_id)
-            retraining_queue.task_done()
-
-# ------------------ Helper Functions for Historic Data ------------------
-
-def fetch_last_year_data(market_id, timeframe=TIMEFRAME, csv_filename=None):
+def process_kline_message(msg):
+    """Handles incoming kline messages."""
     try:
-        exchange = ccxt.binanceusdm({
-            'apiKey': os.getenv('BINANCE_API_KEY'),
-            'secret': os.getenv('BINANCE_SECRET_KEY'),
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future'},
-            'timeout': 30000
-        })
-        now = exchange.milliseconds()
-        one_year_ago = now - 365 * 24 * 60 * 60 * 1000
-        all_ohlcv = []
-        since = one_year_ago
-        while since < now:
-            try:
-                ohlcv = exchange.fetch_ohlcv(market_id, timeframe=timeframe, since=since, limit=1000)
-                if not ohlcv:
-                    break
-                all_ohlcv.extend(ohlcv)
-                last_timestamp = ohlcv[-1][0]
-                if last_timestamp == since:
-                    break
-                since = last_timestamp + 1
-                if last_timestamp >= now:
-                    break
-            except Exception as e:
-                logging.exception(f"Error fetching historical data for {market_id}: {e}")
-                break
-        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-
-        # Compute features directly without X, y split for CSV purposes
-        df_processed = df.copy()
-        df_processed['EMA_20'] = ta.ema(df['close'], length=20)
-        df_processed['EMA_50'] = ta.ema(df['close'], length=50)
-        df_processed['RSI_14'] = ta.rsi(df['close'], length=14)
-        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-        df_processed['MACD'] = macd['MACD_12_26_9']
-        df_processed['MACD_Signal'] = macd['MACDs_12_26_9']
-        df_processed['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        bollinger = ta.bbands(df['close'], length=20, std=2)
-        df_processed['BB_PCT'] = bollinger['BBP_20_2.0']
-        df_processed['OBV'] = ta.obv(df['close'], df['volume'])
-        df_processed['CMF'] = ta.cmf(df['high'], df['low'], df['close'], df['volume'])
-        df_processed['EMA_20_Cross_EMA_50'] = np.where(
-            (df_processed['EMA_20'] > df_processed['EMA_50']) & (df_processed['EMA_20'].shift(1) <= df_processed['EMA_50'].shift(1)), 1,
-            np.where((df_processed['EMA_20'] < df_processed['EMA_50']) & (df_processed['EMA_20'].shift(1) >= df_processed['EMA_50'].shift(1)), -1, 0)
-        )
-        df_processed['EMA_20_GT_EMA_50'] = (df_processed['EMA_20'] > df_processed['EMA_50']).astype(int)
-        stoch_rsi = ta.stochrsi(df['close'])
-        df_processed['StochRSI_Cross_D'] = np.where(
-            (stoch_rsi['STOCHRSIk_14_14_3_3'] > stoch_rsi['STOCHRSId_14_14_3_3']) & 
-            (stoch_rsi['STOCHRSIk_14_14_3_3'].shift(1) <= stoch_rsi['STOCHRSId_14_14_3_3'].shift(1)), 1,
-            np.where((stoch_rsi['STOCHRSIk_14_14_3_3'] < stoch_rsi['STOCHRSId_14_14_3_3']) & 
-                     (stoch_rsi['STOCHRSIk_14_14_3_3'].shift(1) >= stoch_rsi['STOCHRSId_14_14_3_3'].shift(1)), -1, 0)
-        )
-        df_processed['RSI_Overbought'] = (df_processed['RSI_14'] > 70).astype(int)
-        df_processed['RSI_Oversold'] = (df_processed['RSI_14'] < 30).astype(int)
-        df_processed['BB_Overextended'] = ((df_processed['BB_PCT'] > 1) | (df_processed['BB_PCT'] < 0)).astype(int)
-        df_processed.dropna(inplace=True)
-
-        if csv_filename:
-            df_processed.to_csv(csv_filename, index=False)
-            logging.info(f"Saved processed historic data to {csv_filename}")
-        return df  # Return raw OHLCV for downstream use
-    except Exception as e:
-        logging.exception(f"Failed to fetch last year data for {market_id}: {e}")
-        return pd.DataFrame()
-# ------------------ Data Fetching Thread Function ------------------
-
-def fetch_and_store_historic_data_threaded():
-    logging.info("Historical data download thread started.")
-    exchange = ccxt.binanceusdm({
-        'apiKey': os.getenv('BINANCE_API_KEY'),
-        'secret': os.getenv('BINANCE_SECRET_KEY'),
-        'enableRateLimit': True,
-        'options': {'defaultType': 'future'}
-    })
-    active_markets = fetch_active_symbols(exchange)
-    if not active_markets:
-        logging.error("No active markets found, cannot fetch historical data.")
-        return
-
-    for unified_symbol, market_id in active_markets:
-        csv_filename = get_historic_csv_filename(market_id)
-        if not os.path.exists(csv_filename):
-            logging.info(f"Downloading historical data for {market_id} to {csv_filename}...")
-            fetch_last_year_data(market_id, timeframe=TIMEFRAME, csv_filename=csv_filename)
-        else:
-            logging.info(f"Historical data already exists for {market_id} at {csv_filename}. Skipping download.")
-    logging.info("Historical data download thread finished.")
-    gc.collect()
-
-# ------------------ Data Generator Function with Optional Weighting ------------------
-
-def data_generator(X, y, batch_size, use_weights=True, decay=0.9):  # Adjusted decay from 0.99 to 0.95
-    num_samples = len(X)
-    while True:
-        indices = np.arange(num_samples)
-        if use_weights:
-            # Steeper decay: newer samples have much higher weight
-            weights = np.array([decay ** (num_samples - 1 - i) for i in range(num_samples)], dtype=np.float32)
-            weights /= weights.sum()  # Normalize weights to sum to 1
-            indices = np.random.choice(indices, size=num_samples, p=weights, replace=True)
-
-        for i in range(0, num_samples, batch_size):
-            end_i = min(i + batch_size, num_samples)
-            batch_indices = indices[i:end_i]
-            batch_X = X[batch_indices]
-            batch_y = y[batch_indices]
-            if use_weights:
-                batch_weights = weights[batch_indices]
-                yield batch_X, batch_y, batch_weights
-            else:
-                yield batch_X, batch_y
-
-# ------------------ Model Training Thread Function (Incremental Saving with Resume) ------------------
-
-def train_market_model_in_background(market_id, model, X_live, y_live, scaler_live):
-    """Retrains the market model using live data with an efficient tf.data pipeline."""
-    try:
-        # Clear TensorFlow session and graph to prevent state corruption
-        tf.keras.backend.clear_session()
-        tf.compat.v1.reset_default_graph()
-        # Load progress to check last training time
-        progress = {
-            'completed_markets': [],
-            'historical_training_completed': False,
-            'training_times': {}
-        }
-        if os.path.exists(BAAP_TRAINED_FLAG_FILENAME):
-            with open(BAAP_TRAINED_FLAG_FILENAME, 'rb') as f:
-                loaded_progress = pickle.load(f)
-                progress.update(loaded_progress)
-
-        # Check if retraining is needed
-        current_time = datetime.datetime.now()
-        last_train_time = progress['training_times'].get(market_id)
-        # if last_train_time and (current_time - last_train_time).total_seconds() < 24 * 60 * 60:
-        #     logging.info(f"Skipping retraining for {market_id}; last trained at {last_train_time}, less than 24 hours ago.")
-        #     return
-
-        # Verify model is valid
-        if model is None:
-            logging.error(f"Model for {market_id} is None. Cannot retrain.")
+        if msg.get('e') == 'error':
+            logger.error(f"Kline WS Error: {msg.get('m')}")
             return
-        # Split data
-        X_train, X_val, y_train, y_val = train_test_split(X_live, y_live, test_size=0.2, shuffle=False)
-        batch_size = 32
+        if 'k' not in msg:
+            logger.debug(f"Ignoring non-kline message: {msg.get('e')}")
+            return
 
-        # Create datasets
-        train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
-        train_dataset = train_dataset.shuffle(buffer_size=len(X_train)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-        val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val))
-        val_dataset = val_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        kline = msg['k']
+        symbol = kline['s']
+        is_closed = kline['x']
+        start_time = kline['t']
+        
+        # Structure the data similarly to fetch_ohlcv output but as a dict
+        kline_data = {
+            'timestamp': pd.to_datetime(start_time, unit='ms', utc=True), # Pandas Timestamp for consistency
+            'open': float(kline['o']),
+            'high': float(kline['h']),
+            'low': float(kline['l']),
+            'close': float(kline['c']),
+            'volume': float(kline['v']),
+            'is_closed': is_closed # Add flag to know if candle is finished
+        }
 
-        # Callbacks
-        callbacks = [
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, verbose=1, min_lr=1e-6),
-            EarlyStopping(monitor='val_loss', patience=3, min_delta=1e-4, verbose=1),
-        ]
+        with kline_lock:
+            if symbol not in latest_kline_data:
+                 # Initialize deque when first message arrives
+                 # We fetch historical data initially, so deque should exist
+                 # If not, maybe log an error or initialize here cautiously
+                 logger.warning(f"Received kline for {symbol} but no deque initialized. Initial fetch might have failed.")
+                 latest_kline_data[symbol] = deque(maxlen=LIMIT + 10) # Add buffer
 
-        # Train with timing
-        logging.info(f"Starting background retraining for {market_id}...")
-        start_time = time.time()
-        history = model.fit(
-            train_dataset,
-            validation_data=val_dataset,
-            epochs=10,
-            callbacks=callbacks,
-            verbose=1
-        )
-        training_time = time.time() - start_time
-        logging.info(f"Background retraining for {market_id} completed in {training_time:.2f} seconds.")
+            current_deque = latest_kline_data[symbol]
 
-        # Evaluate
-        evaluation = model.evaluate(X_live, y_live, verbose=0)
-        logging.info(f"Market {market_id} - Background training loss: {evaluation[0]:.4f}")
-
-        # Save model and scaler
-        model.save(get_model_filename(market_id))
-        with open(get_scaler_filename(market_id), 'wb') as f:
-            pickle.dump(scaler_live, f)
-        market_models[market_id] = model
-        market_scalers[market_id] = scaler_live
-
-        # Update training time
-        progress['training_times'][market_id] = current_time
-        with open(BAAP_TRAINED_FLAG_FILENAME, 'wb') as f:
-            pickle.dump(progress, f)
-        logging.info(f"Updated training time for {market_id} in {BAAP_TRAINED_FLAG_FILENAME}")
-    except Exception as e:
-        logging.exception(f"Error in background training for {market_id}: {e}")
-    finally:
-        gc.collect()
-
-
-def train_market_models_threaded():
-    global historical_training_completed
-    logging.info("Market models training thread started (incremental).")
-    exchange = ccxt.binanceusdm()
-    active_markets = fetch_active_symbols(exchange)
-    if not active_markets:
-        logging.error("No active markets found, cannot train market models.")
-        return
-
-    # Load progress, including training times
-    progress = {
-        'completed_markets': [],
-        'historical_training_completed': False,
-        'training_times': {}  # New field for timestamps
-    }
-    if os.path.exists(BAAP_TRAINED_FLAG_FILENAME):
-        try:
-            with open(BAAP_TRAINED_FLAG_FILENAME, 'rb') as f:
-                loaded_progress = pickle.load(f)
-                progress.update(loaded_progress)  # Merge with defaults
-            logging.info(f"Loaded training progress: {progress}")
-        except Exception as e:
-            logging.error(f"Error loading training progress: {e}. Starting from scratch.")
-
-    for unified_symbol, market_id in active_markets:
-        if market_id in progress['completed_markets']:
-            logging.info(f"Market {market_id} already trained historically. Skipping initial training.")
-            continue
-
-        historic_csv = get_historic_csv_filename(market_id)
-        if not os.path.exists(historic_csv):
-            logging.warning(f"No historical data for {market_id}. Skipping.")
-            continue
-
-        df_market = pd.read_csv(historic_csv)
-        df_market['timestamp'] = pd.to_datetime(df_market['timestamp'])
-
-        logging.info(f"Preprocessing historical data for {market_id}...")
-        X, y, scaler_local = preprocess_data(df_market.copy(), window_size=WINDOW_SIZE)
-        if X.size == 0:
-            logging.warning(f"Not enough data for {market_id}. Skipping.")
-            continue
-
-        logging.info(f"Splitting data and building/loading model for {market_id}...")
-        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
-        input_shape = (X_train.shape[1], X_train.shape[2])
-        model_file = get_model_filename(market_id)
-        scaler_file = get_scaler_filename(market_id)
-
-        if os.path.exists(model_file):
-            try:
-                model_local = tf.keras.models.load_model(model_file)
-                if model_local.output_shape[-1] != PREDICTION_HORIZON:
-                    logging.info(f"Model for {market_id} has incorrect output shape, rebuilding.")
-                    K.clear_session()
-                    model_local = build_model(input_shape, sequence_length=WINDOW_SIZE, model_params=DEFAULT_MODEL_PARAMS)
+            if len(current_deque) > 0:
+                last_candle_in_deque = current_deque[-1]
+                # If the new kline has the same start time, update the last element
+                if last_candle_in_deque['timestamp'].timestamp() * 1000 == start_time:
+                    current_deque[-1] = kline_data # Replace the last (ongoing) candle
+                # If the new kline is a *new* candle (different start time)
                 else:
-                    logging.info(f"Loaded existing model for {market_id}.")
-            except Exception as e:
-                logging.error(f"Error loading model for {market_id}: {e}. Re-initializing.")
-                K.clear_session()
-                model_local = build_model(input_shape, sequence_length=WINDOW_SIZE, model_params=DEFAULT_MODEL_PARAMS)
-        else:
-            K.clear_session()
-            model_local = build_model(input_shape, sequence_length=WINDOW_SIZE, model_params=DEFAULT_MODEL_PARAMS)
-        market_model_params[market_id] = DEFAULT_MODEL_PARAMS.copy()
+                    # Only append if it's truly the next candle sequentially
+                    # (Handle potential duplicates or out-of-order messages)
+                    time_diff = (kline_data['timestamp'] - last_candle_in_deque['timestamp']).total_seconds()
+                    expected_diff = ccxt.Exchange.parse_timeframe(TIMEFRAME)
+                    if time_diff >= expected_diff: # Allow for slight timing variations
+                         current_deque.append(kline_data)
+                    else:
+                        logger.warning(f"Ignoring potentially out-of-order/duplicate kline for {symbol}. Timestamps: {last_candle_in_deque['timestamp']} -> {kline_data['timestamp']}")
 
-        callbacks = [
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, verbose=1, min_lr=1e-6),
-            EarlyStopping(monitor='val_loss', patience=3, min_delta=1e-4, verbose=1)
-        ]
-        batch_size = 32
-        train_gen = data_generator(X_train, y_train, batch_size, use_weights=True)
-        val_gen = data_generator(X_val, y_val, batch_size)
-        steps_per_epoch = max(1, len(X_train) // batch_size)
-        validation_steps = max(1, len(X_val) // batch_size)
+            else:
+                # Deque is empty (should only happen briefly at startup before history is loaded)
+                current_deque.append(kline_data)
 
-        logging.info(f"Training model for {market_id}...")
-        start_time = time.time()
-        model_local.fit(
-            train_gen,
-            steps_per_epoch=steps_per_epoch,
-            epochs=10,
-            validation_data=val_gen,
-            validation_steps=validation_steps,
-            callbacks=callbacks,
-            verbose=1
-        )
-        training_time = time.time() - start_time
-        logging.info(f"Training for {market_id} completed in {training_time:.2f} seconds.")
 
-        logging.info(f"Saving model and scaler for {market_id}...")
-        model_local.save(model_file)
-        with open(scaler_file, 'wb') as f:
-            pickle.dump(scaler_local, f)
-        market_models[market_id] = model_local
-        market_scalers[market_id] = scaler_local
+        with ws_update_time_lock:
+            last_ws_update_time[symbol] = time.time()
+            
+        # logger.debug(f"Processed kline for {symbol}: {'Closed' if is_closed else 'Ongoing'} @ {kline_data['close']}")
 
-        # Update training time in progress
-        progress['training_times'][market_id] = datetime.datetime.now()
-        with open(BAAP_TRAINED_FLAG_FILENAME, 'wb') as f:
-            pickle.dump(progress, f)
-            f.flush()
-            os.fsync(f.fileno())
-        logging.info(f"Updated training time for {market_id} in {BAAP_TRAINED_FLAG_FILENAME}")
+    except Exception as e:
+        logger.error(f"Error processing kline message: {e}\nMessage: {msg}", exc_info=False)
 
-        del X, y, X_train, X_val, y_train, y_val, train_gen, val_gen
-        gc.collect()
-        logging.info(f"Model trained and saved for {market_id}.")
 
-        progress['completed_markets'].append(market_id)
-        with open(BAAP_TRAINED_FLAG_FILENAME, 'wb') as f:
-            pickle.dump(progress, f)
-            f.flush()
-            os.fsync(f.fileno())
-        logging.info(f"Training progress updated for {market_id}")
+# Helper to manage depth updates efficiently
+def update_depth_cache(symbol, bids, asks, last_update_id):
+     with depth_lock:
+        if symbol not in latest_depth_data:
+             # Initialize structure if not present (e.g., on first diff after snapshot)
+             latest_depth_data[symbol] = {'bids': {}, 'asks': {}, 'lastUpdateId': 0}
 
-    progress['historical_training_completed'] = True
-    with open(BAAP_TRAINED_FLAG_FILENAME, 'wb') as f:
-        pickle.dump(progress, f)
-    logging.info(f"Historical training completed flag saved")
-    historical_training_completed = True
-    logging.info("Market models training thread finished (incremental).")
+        # Apply bid updates
+        for price_str, qty_str in bids:
+            price = float(price_str)
+            qty = float(qty_str)
+            if qty == 0:
+                if price in latest_depth_data[symbol]['bids']:
+                    del latest_depth_data[symbol]['bids'][price]
+            else:
+                latest_depth_data[symbol]['bids'][price] = qty
 
-# ------------------ Market and Data Fetching Functions ------------------
-@retry(stop=stop_after_attempt(5),
-       wait=wait_exponential(multiplier=1, min=4, max=30),
-       retry=retry_if_exception_type((RequestTimeout, ExchangeError)),
-       reraise=True)
-def fetch_active_symbols(exchange):
+        # Apply ask updates
+        for price_str, qty_str in asks:
+            price = float(price_str)
+            qty = float(qty_str)
+            if qty == 0:
+                if price in latest_depth_data[symbol]['asks']:
+                    del latest_depth_data[symbol]['asks'][price]
+            else:
+                latest_depth_data[symbol]['asks'][price] = qty
+
+        # Keep bids sorted high to low, asks low to high (optional but good practice)
+        latest_depth_data[symbol]['bids'] = dict(sorted(latest_depth_data[symbol]['bids'].items(), reverse=True))
+        latest_depth_data[symbol]['asks'] = dict(sorted(latest_depth_data[symbol]['asks'].items()))
+
+        # Update the last update ID
+        latest_depth_data[symbol]['lastUpdateId'] = last_update_id
+
+def process_depth_message(msg):
+    """Handles incoming depth messages (diffs)."""
     try:
-        markets = exchange.load_markets()
-        # Filter for USDT-settled, active markets, excluding ETH and BTC pairs
-        active_markets = [
-            (symbol, market['id'], market.get('type', ''))
-            for symbol, market in markets.items()
-            if market.get("settle") == "USDT" and market.get("active")
-            and "ETH" not in market['id']
-            and "BTC" not in market['id']
-        ]
-        swap_markets = [(symbol, market_id) for symbol, market_id, m_type in active_markets if m_type == 'swap']
-        future_markets = [(symbol, market_id) for symbol, market_id, m_type in active_markets if m_type == 'future']
+        if msg.get('e') == 'error':
+            logger.error(f"Depth WS Error: {msg.get('m')}")
+            return
+        if msg.get('e') != 'depthUpdate':
+             logger.debug(f"Ignoring non-depthUpdate message: {msg.get('e')}")
+             return
 
-        # Dictionary to store metrics: (abs_price_change, volume_increase)
-        market_metrics = {}
+        symbol = msg['s']
+        first_update_id = msg['U']
+        final_update_id = msg['u']
+        bids_update = msg['b']
+        asks_update = msg['a']
 
-        # Fetch OHLCV data for swap markets (last 15 minutes, 1m candles)
-        if swap_markets:
-            exchange.options['defaultType'] = 'swap'
-            for symbol, market_id in swap_markets:
+        with depth_lock:
+            # Check if we have a cache and if the update aligns
+            if symbol in latest_depth_data:
+                cached_last_update_id = latest_depth_data[symbol].get('lastUpdateId', 0)
+
+                # Standard Binance logic: Drop events where msg['U'] <= lastUpdateId
+                # Process first event where msg['U'] <= lastUpdateId + 1 and msg['u'] >= lastUpdateId + 1
+                if final_update_id <= cached_last_update_id:
+                     # logger.debug(f"Depth update for {symbol} too old (u={final_update_id} <= cache={cached_last_update_id}). Skipping.")
+                     return # Ignore old update
+
+                if first_update_id > cached_last_update_id + 1:
+                    # Gap detected! Need to resync.
+                    logger.warning(f"Depth cache gap detected for {symbol} (U={first_update_id} > cache={cached_last_update_id}+1). Clearing cache, resync needed.")
+                    # Clear cache - A resync mechanism should ideally fetch a new snapshot
+                    # For now, we just clear and wait for the next update that fits.
+                    # A robust solution would trigger a snapshot fetch here.
+                    del latest_depth_data[symbol]
+                    # Maybe need to signal main loop to avoid using this symbol's depth until resynced
+                    return
+
+                # If we are here, the update is okay to apply (U <= L+1 and u >= L+1)
+                update_depth_cache(symbol, bids_update, asks_update, final_update_id)
+                # logger.debug(f"Updated depth cache for {symbol} via diff (u={final_update_id})")
+
+            else:
+                # No cache yet, likely waiting for initial snapshot fetch to complete.
+                # We can't apply diffs without a base.
+                logger.debug(f"Received depth diff for {symbol} but cache not initialized. Waiting for snapshot.")
+                # Log when the update *would* have been applied if cache existed
+                # This helps debug if snapshot fetch is slow/failing
+                # Store the last attempted update ID?
+
+        with ws_update_time_lock:
+            last_ws_update_time[symbol] = time.time()
+
+    except Exception as e:
+        logger.error(f"Error processing depth message: {e}\nMessage: {msg}", exc_info=False)
+
+
+def process_ticker_message(msg):
+    """Handles incoming ticker messages."""
+    try:
+        if msg.get('e') == 'error':
+            logger.error(f"Ticker WS Error: {msg.get('m')}")
+            return
+        if msg.get('e') != '24hrTicker':
+            logger.debug(f"Ignoring non-ticker message: {msg.get('e')}")
+            return
+
+        symbol = msg['s']
+        # Store relevant parts of the ticker info
+        ticker_info = {
+            'last_price': float(msg['c']),
+            'price_change_percent': float(msg['P']),
+            'high': float(msg['h']),
+            'low': float(msg['l']),
+            'volume': float(msg['v']),
+            'quote_volume': float(msg['q']),
+            'timestamp': time.time() # Add timestamp of reception
+        }
+
+        with ticker_lock:
+            latest_ticker_data[symbol] = ticker_info
+
+        with ws_update_time_lock:
+             # May not need separate update time if ticker_info includes it
+             # But good for a central "last seen" check
+            last_ws_update_time[symbol] = time.time()
+
+        # logger.debug(f"Processed ticker for {symbol}: Price={ticker_info['last_price']}")
+
+    except Exception as e:
+        logger.error(f"Error processing ticker message: {e}\nMessage: {msg}", exc_info=False)
+
+# --- End WebSocket Callbacks ---
+
+
+# --- Existing Functions (Modified where needed) ---
+
+# File Writer Worker (Unchanged, uses queue)
+def file_writer_worker():
+    """Worker thread that processes file update requests from a queue."""
+    logger.info("File writer worker thread started.")
+    while not file_writer_stop_event.is_set():
+        try:
+            try:
+                task = file_update_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            file_type = task.get('type')
+            data = task.get('data')
+            symbol = task.get('symbol')
+
+            if not file_type or data is None:
+                logger.warning(f"Invalid task received in file writer queue: {task}")
+                file_update_queue.task_done()
+                continue
+
+            if file_type == 'trade_log':
                 try:
-                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=15)
-                    if len(ohlcv) < 15:
-                        logging.warning(f"Insufficient data for {symbol} (swap): {len(ohlcv)} candles. Skipping.")
-                        continue
-                    # Extract first and last candles
-                    close_first = float(ohlcv[0][4])  # Close price at start
-                    close_last = float(ohlcv[-1][4])  # Close price at end
-                    volume_first = float(ohlcv[0][5])  # Volume at start
-                    volume_last = float(ohlcv[-1][5])  # Volume at end
-
-                    # Calculate absolute price change and volume increase
-                    abs_price_change = abs((close_last - close_first) / close_first) if close_first != 0 else 0.0
-                    volume_increase = (volume_last - volume_first) / volume_first if volume_first != 0 else 0.0
-
-                    # Only include markets with volume increase
-                    if volume_increase > 0:
-                        market_metrics[symbol] = (abs_price_change, volume_increase)
-                    # else:
-                    #     logging.info(f"Excluded {symbol} (swap): Volume decreased ({volume_increase:.4%}).")
+                    date_str = time.strftime("%Y%m%d", time.localtime())
+                    filename = f"{symbol.replace('/', '_').replace(':', '_')}_{date_str}_trades.csv"
+                    filepath = os.path.join(TRADE_LOG_DIR, filename)
+                    file_exists = os.path.isfile(filepath)
+                    df_to_log = pd.DataFrame([data])
+                    df_to_log.to_csv(filepath, mode='a', header=not file_exists, index=False)
                 except Exception as e:
-                    logging.warning(f"Error fetching OHLCV for {symbol} (swap): {e}. Skipping.")
-                    continue
+                    logger.error(f"File writer error processing trade_log for {symbol}: {e}", exc_info=False)
 
-        # Fetch OHLCV data for future markets (last 15 minutes, 1m candles)
-        if future_markets:
-            exchange.options['defaultType'] = 'future'
-            for symbol, market_id in future_markets:
+            elif file_type == 'params':
                 try:
-                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=15)
-                    if len(ohlcv) < 15:
-                        logging.warning(f"Insufficient data for {symbol} (future): {len(ohlcv)} candles. Skipping.")
-                        continue
-                    close_first = float(ohlcv[0][4])
-                    close_last = float(ohlcv[-1][4])
-                    volume_first = float(ohlcv[0][5])
-                    volume_last = float(ohlcv[-1][5])
-
-                    abs_price_change = abs((close_last - close_first) / close_first) if close_first != 0 else 0.0
-                    volume_increase = (volume_last - volume_first) / volume_first if volume_first != 0 else 0.0
-
-                    if volume_increase > 0:
-                        market_metrics[symbol] = (abs_price_change, volume_increase)
-                    # else:
-                    #     logging.info(f"Excluded {symbol} (future): Volume decreased ({volume_increase:.4%}).")
+                    filename = symbol.replace('/', '_').replace(':', '_') + '.json'
+                    filepath = os.path.join(PARAMS_DIR, filename)
+                    temp_filepath = filepath + '.tmp'
+                    with open(temp_filepath, 'w') as f:
+                        json.dump(data, f, indent=4)
+                    if os.path.exists(temp_filepath): os.replace(temp_filepath, filepath)
                 except Exception as e:
-                    logging.warning(f"Error fetching OHLCV for {symbol} (future): {e}. Skipping.")
-                    continue
+                    logger.error(f"File writer error processing params for {symbol}: {e}", exc_info=False)
 
-        # Reset default type to swap
-        exchange.options['defaultType'] = 'swap'
+            elif file_type == 'pattern_stats':
+                 try:
+                    if not symbol:
+                        logger.error("Missing symbol for pattern_stats save request.")
+                        file_update_queue.task_done()
+                        continue
+                    filename = f"{symbol.replace('/', '_').replace(':', '_')}_ob_oi_pattern_stats.json"
+                    filepath = os.path.join(PATTERN_STATS_DIR, filename)
+                    temp_filepath = filepath + '.tmp'
+                    with open(temp_filepath, 'w') as f:
+                         json.dump(data, f, indent=4)
+                    if os.path.exists(temp_filepath): os.replace(temp_filepath, filepath)
+                 except Exception as e:
+                    logger.error(f"File writer error processing pattern_stats for {symbol}: {e}", exc_info=True)
+            else:
+                logger.warning(f"Unknown file type '{file_type}' received in file writer queue.")
 
-        # If no metrics were calculated, return empty list
-        if not market_metrics:
-            logging.error("No valid markets with volume increase in last 15 mins.")
+            file_update_queue.task_done()
+
+        except Exception as e:
+            logger.error(f"Unexpected error in file_writer_worker loop: {e}", exc_info=True)
+            # Avoid busy-waiting on error
+            if not file_writer_stop_event.is_set():
+                 time.sleep(1)
+
+
+    logger.info("File writer worker thread stopped.")
+
+
+# Metrics, Logging, Params (Largely Unchanged)
+def log_trade_metrics(reason, increment=True):
+    """Increment and log metrics on trade filtering."""
+    global global_metrics
+    if increment and reason in global_metrics: global_metrics[reason] += 1
+    current_time = time.time()
+    if current_time - global_metrics.get('last_reset', 0) > 86400:
+        report_metrics()
+        for key in global_metrics:
+            if key != 'last_reset': global_metrics[key] = 0
+        global_metrics['last_reset'] = current_time
+        logger.info("Trade metrics reset")
+
+def report_metrics():
+    """Generate a report of current trade filtering metrics."""
+    global global_metrics
+    patterns_detected = global_metrics.get('patterns_detected', 0)
+    if patterns_detected > 0:
+        success_rate = global_metrics.get('successful_entries', 0) / patterns_detected * 100
+        report = f"\n{'='*50}\nTRADE FILTERING METRICS REPORT\n{'='*50}\n\n"
+        report += f"Total Patterns Detected: {patterns_detected}\n"
+        report += f"Successful Trade Entries: {global_metrics.get('successful_entries', 0)} ({success_rate:.2f}%)\n\n"
+        report += "REJECTION REASONS:\n"
+        # Simplified report generation
+        for i, (key, value) in enumerate(global_metrics.items()):
+             if key not in ['patterns_detected', 'successful_entries', 'last_reset']:
+                 pct = value / patterns_detected * 100 if patterns_detected else 0
+                 report += f"{i+1}. {key.replace('_', ' ').title()}: {value} ({pct:.2f}%)\n"
+        report += f"\n{'='*50}\n"
+        logger.info(report)
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        report_path = os.path.join(TRADE_LOG_DIR, f"trade_metrics_{timestamp}.txt")
+        try:
+            with open(report_path, 'w') as f: f.write(report)
+            logger.info(f"Trade metrics report saved to {report_path}")
+        except Exception as e:
+             logger.error(f"Failed to save metrics report: {e}")
+    else:
+        logger.info("No patterns detected since last reset, no metrics to report")
+
+def log_trade_funnel():
+     """Periodically log the trade funnel to track conversion rates."""
+     patterns_detected = global_metrics.get('patterns_detected', 0)
+     if patterns_detected == 0:
+         logger.info("No patterns detected yet, cannot calculate trade funnel")
+         return
+
+     # Simplified calculation
+     steps = {
+         'Detected': patterns_detected,
+         'Passed Threshold': patterns_detected - global_metrics.get('patterns_below_threshold', 0),
+         'Passed TF Confirm': (patterns_detected - global_metrics.get('patterns_below_threshold', 0)) - global_metrics.get('insufficient_tf_confirmation', 0),
+         'Passed Sequence': ((patterns_detected - global_metrics.get('patterns_below_threshold', 0)) - global_metrics.get('insufficient_tf_confirmation', 0)) - global_metrics.get('failed_sequence_check', 0),
+         # ... add other steps similarly ...
+         'Passed Proximity': (((patterns_detected - global_metrics.get('patterns_below_threshold', 0)) - global_metrics.get('insufficient_tf_confirmation', 0)) - global_metrics.get('failed_sequence_check', 0) - global_metrics.get('failed_reversal_check', 0) - global_metrics.get('failed_risk_reward', 0)), # Example calculation up to RR
+         'Successful Orders': global_metrics.get('successful_entries', 0)
+     }
+     # Calculate step after proximity check correctly
+     passed_rr = steps['Passed Proximity'] # This is actually passed RR check based on above calc
+     steps['Passed Proximity Check'] = passed_rr - global_metrics.get('failed_proximity_check', 0) # Now calculate based on proximity failures
+     steps['Successful Orders'] = global_metrics.get('successful_entries', 0)
+
+
+     logger.info("\n" + "-" * 40 + "\nTRADE FUNNEL ANALYSIS\n" + "-" * 40)
+     last_step_count = patterns_detected
+     for name, count in steps.items():
+         if count < 0: count = 0 # Ensure count doesn't go negative
+         rate = count / last_step_count * 100 if last_step_count > 0 else 0
+         logger.info(f"{name}: {count} ({rate:.1f}%)")
+         # Update last_step_count for the *next* percentage calculation relative to the previous step
+         # Only update if the current step represents a filtering stage (not the final success)
+         if name != 'Successful Orders':
+             last_step_count = count # Use the count of the current step as the base for the next step's %
+
+     overall_conversion = steps['Successful Orders'] / patterns_detected * 100 if patterns_detected > 0 else 0
+     logger.info("-" * 40 + f"\nOVERALL CONVERSION RATE: {overall_conversion:.2f}%\n" + "-" * 40)
+
+
+def log_trade(symbol, trade_info, force_write=False):
+    """ Queue trade details for logging. (Unchanged logic, uses queue) """
+    try:
+        trade_info['symbol'] = symbol
+        if 'timestamp' not in trade_info: trade_info['timestamp'] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        if 'position_status' not in trade_info: trade_info['position_status'] = 'Closed' if trade_info.get('exit_reason') else 'Open'
+
+        essential_cols = ['symbol', 'timestamp', 'position_status', 'position_type', 'entry_price', 'exit_price', 'stop_loss', 'target', 'entry_reason', 'exit_reason', 'profit_pct', 'leverage', 'signal_strength', 'risk_reward']
+        log_data = {col: trade_info.get(col) for col in essential_cols}
+
+        if log_data.get('exit_price') is not None and log_data.get('entry_price') is not None and log_data['entry_price'] != 0:
+             pnl_mult = 1 if log_data.get('position_type') == 'long' else -1
+             log_data['profit_pct'] = ((log_data['exit_price'] - log_data['entry_price']) / log_data['entry_price']) * pnl_mult * 100
+
+        task = {'type': 'trade_log', 'symbol': symbol, 'data': log_data}
+        file_update_queue.put(task)
+
+        status_msg = f"Status: {log_data.get('position_status', 'N/A')}"
+        pnl_msg = f"PnL: {log_data.get('profit_pct', 0):.2f}%" if log_data.get('profit_pct') is not None else ""
+        reason_msg = f"Entry: {log_data.get('entry_reason', 'N/A')}" + (f" -> Exit: {log_data.get('exit_reason')}" if log_data.get('exit_reason') else "")
+        logger.info(f"TRADE QUEUED: {symbol} | {reason_msg} | {status_msg} | {pnl_msg}")
+
+        # Update pattern statistics (Unchanged logic)
+        if log_data.get('position_status') == 'Closed' and log_data.get('signal_type'):
+            try:
+                signal_type = log_data['signal_type']
+                profit_pct = log_data.get('profit_pct', 0)
+                win = profit_pct > 0 if profit_pct is not None else False
+                with indicator_lock:
+                    if symbol in symbol_indicators:
+                        symbol_indicators[symbol].update_pattern_trade_result(signal_type, profit_pct, win=win)
+            except Exception as e:
+                logger.warning(f"Could not update pattern statistics after queuing trade log: {e}")
+        return True
+    except Exception as e:
+        logger.exception(f"Error queuing trade log for {symbol}: {e}")
+        return False
+
+def save_params(symbol, params):
+    """ Queue parameters for saving. (Unchanged logic, uses queue) """
+    try:
+        clean_symbol = symbol.replace('/', '_').replace(':', '_')
+        serializable_params = {}
+        # Basic serialization handling (adjust if complex objects are in params)
+        for k, v in params.items():
+            if k in ['file_queue', 'symbol']: continue # Don't save these
+            try:
+                 # Attempt to JSON serialize; if fails, convert or skip
+                 json.dumps({k: v}) # Test serialization
+                 serializable_params[k] = v
+            except TypeError:
+                 if isinstance(v, (np.integer, np.floating)): serializable_params[k] = v.item()
+                 elif isinstance(v, np.ndarray): serializable_params[k] = v.tolist()
+                 else: logger.debug(f"Skipping non-serializable param {k} type {type(v)} for {symbol}")
+
+        task = {'type': 'params', 'symbol': clean_symbol, 'data': serializable_params}
+        file_update_queue.put(task)
+        logger.info(f"Queued saving parameters for {symbol}")
+        filepath = os.path.join(PARAMS_DIR, clean_symbol + '.json')
+        return filepath
+    except Exception as e:
+         logger.exception(f"Error queueing params for {symbol}: {e}")
+         return None
+
+def load_params(symbol):
+    """Load parameters for a symbol. (Unchanged)"""
+    filename = symbol.replace('/', '_').replace(':', '_') + '.json'
+    filepath = os.path.join(PARAMS_DIR, filename)
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r') as f: return json.load(f)
+        except Exception as e: logger.exception(f"Error loading parameters for {symbol}: {e}")
+    return None
+
+
+# --- Data Fetching / Retrieval ---
+
+def fetch_initial_klines(exchange, market_id, timeframe=TIMEFRAME, limit=LIMIT):
+    """ Fetch initial historical klines using ccxt """
+    try:
+        # Fetch slightly more to ensure limit after potential processing
+        ohlcv = exchange.fetch_ohlcv(market_id, timeframe=timeframe, limit=limit + 5)
+        if not ohlcv:
+            logger.warning(f"fetch_initial_klines received no data for {market_id}")
             return []
 
-        # Sort markets: primary by abs_price_change, secondary by volume_increase
-        sorted_symbols = sorted(
-            market_metrics.keys(),
-            key=lambda x: (market_metrics[x][0], market_metrics[x][1]),
-            reverse=True
-        )
-        sorted_active_markets = [
-            (symbol, next(market_id for s, market_id, _ in active_markets if s == symbol))
-            for symbol in sorted_symbols
-        ]
+        # Convert to list of dicts matching WS structure (for consistency)
+        kline_list = []
+        for candle in ohlcv:
+            ts, O, H, L, C, V = candle
+            # Assume fetched candles are closed
+            kline_list.append({
+                 'timestamp': pd.to_datetime(ts, unit='ms', utc=True),
+                 'open': float(O), 'high': float(H), 'low': float(L), 'close': float(C), 'volume': float(V),
+                 'is_closed': True
+            })
 
-        # Log top 5 for debugging
-        logging.info("Top 5 markets by abs % price change (primary) and % volume increase (secondary, last 15 mins):")
-        for symbol in sorted_symbols[:5]:
-            abs_price_chg, volume_inc = market_metrics[symbol]
-            logging.info(f"{symbol}: Abs Price Change {abs_price_chg:.4%}, Volume Increase {volume_inc:.4%}")
-
-        return sorted_active_markets
-
+        # Return only the last 'limit' candles
+        return kline_list[-limit:]
+    except ccxt.RateLimitExceeded as e:
+         logger.warning(f"Rate limit hit fetching initial klines for {market_id}: {e}. Retrying might be needed.")
+         time.sleep(10) # Basic wait
+         return None # Signal failure or retry needed
     except Exception as e:
-        logging.exception(f"Error loading markets or calculating metrics: {e}")
-        return []
+        logger.exception(f"Failed to fetch initial klines for {market_id}: {e}")
+        return None # Indicate error
 
-# ------------------ Trading Functions ------------------
+def get_kline_df(symbol):
+    """ Gets the current kline data as a DataFrame from the deque """
+    with kline_lock:
+        if symbol not in latest_kline_data or not latest_kline_data[symbol]:
+             return pd.DataFrame() # Return empty DF if no data
 
-@retry(stop=stop_after_attempt(5),
-       wait=wait_exponential(multiplier=1, min=4, max=30),
-       retry=retry_if_exception_type((RequestTimeout, ExchangeError)),
-       reraise=True)
-def fetch_open_positions(exchange):
-    open_positions_map = {}
+        # Convert deque of dicts to DataFrame
+        df = pd.DataFrame(list(latest_kline_data[symbol]))
+        if df.empty:
+            return df
+
+        # Set timestamp as index
+        if 'timestamp' in df.columns:
+             df.set_index('timestamp', inplace=True)
+        else:
+             logger.error(f"Timestamp column missing in kline data for {symbol}")
+             return pd.DataFrame()
+
+        # Ensure correct data types (might be redundant if process_kline_message handles it)
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Remove the current incomplete candle for indicator calculations if needed
+        # Assuming indicator wants only closed candles. Check indicator requirements.
+        # Or the indicator needs to handle the last candle appropriately.
+        # Let's return the full DF including the potentially incomplete last candle for now.
+        # The indicator logic might need adjustment if it assumes all candles are closed.
+        # df_closed = df[df['is_closed'] == True] # Option 1: Only closed
+        # return df_closed.drop(columns=['is_closed'])
+
+        return df # Option 2: Return all, indicator handles it
+
+
+def fetch_initial_order_book(exchange, symbol, limit=1000):
+    """ Fetches the initial order book snapshot using ccxt """
     try:
-        positions = exchange.fetch_positions()
-        for pos in positions:
-            amt = float(pos['info'].get('positionAmt', 0))
-            if amt != 0 and 'symbol' in pos:
-                try:
-                    market_info = exchange.market(pos['symbol'])
-                    m_id = market_info['id']
-                    open_positions_map[m_id] = pos
-                except Exception as conv_e:
-                    logging.warning(f"Conversion error for {pos['symbol']}: {conv_e}")
-        return open_positions_map
-    except Exception as e:
-        logging.exception(f"Error fetching positions: {e}")
-        return {}
+        # Fetch a deep snapshot (limit 1000 is max for Binance REST)
+        # This is needed to correctly initialize the state before applying WS diffs
+        ob = exchange.fetch_order_book(symbol, limit=limit)
+        last_update_id = ob.get('nonce', 0) # Binance uses 'nonce' for lastUpdateId in REST response
 
-def get_order_quantity(current_price, leverage):
-    """Calculates order quantity based on current price and leverage."""
+        if not last_update_id:
+             logger.warning(f"Order book snapshot for {symbol} missing 'nonce' (lastUpdateId). Depth sync may fail.")
+
+        # Store in the format used by our WS cache
+        with depth_lock:
+            latest_depth_data[symbol] = {
+                'bids': dict(sorted([(float(p), float(q)) for p, q in ob['bids']], reverse=True)),
+                'asks': dict(sorted([(float(p), float(q)) for p, q in ob['asks']])),
+                'lastUpdateId': last_update_id
+            }
+        logger.info(f"Fetched initial order book snapshot for {symbol} up to updateId {last_update_id}")
+        return True
+    except ccxt.RateLimitExceeded as e:
+         logger.warning(f"Rate limit hit fetching initial order book for {symbol}: {e}.")
+         time.sleep(10)
+         return False
+    except Exception as e:
+        logger.exception(f"Failed to fetch initial order book for {symbol}: {e}")
+        return False
+
+def get_order_book(symbol):
+     """ Gets the current order book from the cache """
+     with depth_lock:
+         # Return a copy to prevent modification issues outside the lock
+         # Convert back to list format expected by ccxt/indicator?
+         # The indicator might need adjustment to accept the dict format,
+         # or we convert it here. Let's convert it.
+         ob_data = latest_depth_data.get(symbol)
+         if ob_data:
+             # Convert dict back to list of lists [price, quantity]
+             # Ensure sorting is maintained
+             bids_list = [[p, q] for p, q in sorted(ob_data['bids'].items(), key=lambda item: item[0], reverse=True)]
+             asks_list = [[p, q] for p, q in sorted(ob_data['asks'].items(), key=lambda item: item[0])]
+             # Limit depth if needed, though WS already limits incoming stream
+             bids_list = bids_list[:WEBSOCKET_DEPTH_LEVELS]
+             asks_list = asks_list[:WEBSOCKET_DEPTH_LEVELS]
+
+             # Return in ccxt-like format
+             return {
+                 'bids': bids_list,
+                 'asks': asks_list,
+                 'timestamp': None, # WS doesn't provide per-update timestamp easily
+                 'datetime': None,
+                 'nonce': ob_data['lastUpdateId'] # lastUpdateId from WS
+             }
+         else:
+             return None # No data available
+
+def get_current_price(symbol):
+     """ Gets the latest price from the ticker stream """
+     with ticker_lock:
+         ticker = latest_ticker_data.get(symbol)
+         if ticker:
+             return ticker.get('last_price')
+     return None # No price available
+
+def fetch_open_interest(exchange, symbol):
+    """ Fetch open interest data (Remains polling via REST). """
+    # This function remains largely the same as it relies on polling
+    # We might add caching here if needed, but the original didn't have it explicitly
+    # Use the existing cache mechanism for this?
+    cache_key = f"oi_{symbol}"
+    current_time = time.time()
+
+    with cache_lock: # Reuse the ohlcv cache lock or create a dedicated OI cache lock
+        cached = ohlcv_cache.get(cache_key)
+        if cached and current_time - cached.get('timestamp', 0) < CACHE_TTL:
+            # logger.debug(f"Using cached OI for {symbol}")
+            return cached.get('data')
+
+    # Fetch new data
     try:
-        quantity = (AMOUNT_USD * leverage) / current_price
-        notional = quantity * current_price
-        min_notional = 19  # Minimum 5 USDT as required by Binance
-        if notional < min_notional:
-            quantity = min_notional / current_price
-        return quantity
+        # Assuming exchange object 'exchange' is the ccxt instance
+        if hasattr(exchange, 'fetch_open_interest'):
+            # Use fetch_open_interest if available (standard ccxt way)
+            oi_data = exchange.fetch_open_interest(symbol)
+            oi_value = oi_data.get('openInterestAmount') # Or 'openInterestValue' depending on needs
+            if oi_value is None and 'info' in oi_data:
+                # Fallback to info dict if standard field is missing (exchange specific)
+                oi_value = float(oi_data['info'].get('openInterest', 0)) # Common field name
+            if oi_value is None:
+                 logger.warning(f"Could not extract Open Interest value for {symbol} from: {oi_data}")
+                 return None
+
+            logger.debug(f"Fetched Open Interest for {symbol}: {oi_value}")
+
+            # Update cache
+            with cache_lock:
+                ohlcv_cache[cache_key] = {'data': float(oi_value), 'timestamp': current_time}
+            return float(oi_value)
+
+        else:
+             logger.warning(f"Exchange object does not support fetch_open_interest for {symbol}.")
+             # Fallback simulation (REMOVE FOR PRODUCTION)
+             # current_price = get_current_price(symbol) or 1 # Get price from WS if possible
+             # simulated_oi = current_price * 10000 * (1 + np.random.normal(0, 0.05))
+             # logger.debug(f"Using simulated open interest for {symbol}: {simulated_oi}")
+             # return simulated_oi
+             return None # No real data
+
+    except ccxt.NotSupported:
+         logger.warning(f"fetch_open_interest not supported by exchange for {symbol}")
+         return None
+    except ccxt.RateLimitExceeded as e:
+         logger.warning(f"Rate limit hit fetching OI for {symbol}: {e}")
+         # Return stale cache data if available?
+         with cache_lock:
+             cached = ohlcv_cache.get(cache_key)
+             if cached: return cached.get('data')
+         return None
     except Exception as e:
-        logging.exception(f"Error calculating order quantity: {e}")
-        return 0
-
-def place_order(exchange, market_id, side, quantity, current_price, stop_loss_price=None, take_profit_price=None):
-    # try:
-    #     # Set leverage for the symbol explicitly
-    #     exchange.set_leverage(leverage, market_id)
-    # except Exception as e:
-    #     logging.exception(f"Failed to set leverage for {market_id}: {e}")
-    #     return None
-    params = {}
-
-    if stop_loss_price:
-        params['stopLoss'] = {'price': stop_loss_price, 'type': 'MARKET'}
-    if take_profit_price:
-        params['takeProfit'] = {'price': take_profit_price, 'type': 'MARKET'}
-
-    # If no take profit price is provided, calculate it so that profit is $0.50
-    # if take_profit_price is None:
-    #     if side.lower() == 'buy':
-    #         take_profit_price = current_price + (0.8 * current_price) / (AMOUNT_USD * leverage)
-    #     elif side.lower() == 'sell':
-    #         take_profit_price = current_price - (0.8 * current_price) / (AMOUNT_USD * leverage)
-    take_profit_side = 'sell' if side == 'buy' else 'buy'
-    takeProfitParams = {'stopPrice': take_profit_price , 'timeInForce': 'GTE_GTC'}
-    price = None
-
-    try:
-        order = exchange.create_order(
-            market_id,
-            type='market',
-            side=side,
-            amount=quantity,
-            params=params
-        )
-        logging.info(f"Order placed for {market_id}: {order}")
-        # takeProfitOrder = exchange.create_order(market_id, 'TAKE_PROFIT_MARKET', take_profit_side, quantity, price, takeProfitParams)
-        # logging.info(f"Profit Order placed for {market_id}: {takeProfitOrder}")
-        return order
-    except Exception as e:
-        logging.exception(f"Failed to place order for {market_id}: {e}")
+        logger.error(f"Error fetching open interest for {symbol}: {e}", exc_info=False)
         return None
 
-@retry(stop=stop_after_attempt(5),
-       wait=wait_exponential(multiplier=1, min=4, max=30),
-       retry=retry_if_exception_type((RequestTimeout, ExchangeError)),
-       reraise=True)
-def fetch_binance_data(market_id, timeframe=TIMEFRAME, limit=LIMIT):
-    exchange = ccxt.binanceusdm({
-        'apiKey': os.getenv('BINANCE_API_KEY'),
-        'secret': os.getenv('BINANCE_SECRET_KEY'),
+# --- Indicator Management (Modified) ---
+
+def get_indicator(symbol, exchange, force_new=False):
+    """ Get or create indicator. Now relies less on internal fetching. """
+    global file_update_queue
+    indicator_instance = None
+
+    with indicator_lock:
+        if symbol in symbol_indicators and not force_new:
+            indicator_instance = symbol_indicators[symbol]
+        else:
+            params = load_params(symbol) if not force_new else None
+            if params:
+                params_with_queue = params.copy()
+                params_with_queue['file_queue'] = file_update_queue
+                params_with_queue['symbol'] = symbol
+                try:
+                    # Ensure indicator is initialized correctly without relying on fetch methods
+                    # It should primarily accept dataframes/series/values as input now
+                    symbol_indicators[symbol] = EnhancedOrderBookVolumeWrapper(**params_with_queue)
+                    indicator_instance = symbol_indicators[symbol]
+                    # logger.info(f"Loaded existing parameters for {symbol}")
+                except Exception as e:
+                     logger.error(f"Error creating indicator with loaded params for {symbol}: {e}")
+                     force_new = True
+            
+            if force_new or indicator_instance is None:
+                default_params_copy = DEFAULT_PARAMS.copy()
+                default_params_copy['file_queue'] = file_update_queue
+                default_params_copy['symbol'] = symbol
+                if 'BTC' in symbol: default_params_copy['min_wall_size'] = 50
+                elif 'ETH' in symbol: default_params_copy['min_wall_size'] = 30
+                else: default_params_copy['min_wall_size'] = 20
+                
+                try:
+                    symbol_indicators[symbol] = EnhancedOrderBookVolumeWrapper(**default_params_copy)
+                    indicator_instance = symbol_indicators[symbol]
+                    logger.info(f"Created new indicator with default parameters for {symbol}")
+                    save_params(symbol, default_params_copy) # Queue saving
+                except Exception as e:
+                    logger.critical(f"CRITICAL: Failed to create default indicator for {symbol}: {e}")
+                    return None
+
+    return indicator_instance
+
+# --- Exchange and Position Management (Largely Unchanged logic, but uses ccxt) ---
+
+def create_exchange():
+    """Create and return a CCXT exchange object."""
+    # Ensure API keys are loaded correctly from environment
+    api_key = os.getenv('BINANCE_API_KEY')
+    secret_key = os.getenv('BINANCE_SECRET_KEY')
+    if not api_key or not secret_key:
+        logger.critical("Binance API Key or Secret Key not found in environment variables.")
+        raise ValueError("Missing API Credentials")
+
+    return ccxt.binanceusdm({
+        'apiKey': api_key,
+        'secret': secret_key,
         'enableRateLimit': True,
         'options': {'defaultType': 'future'},
         'timeout': 30000
     })
+
+# get_position_details, is_in_cooldown, can_exit_position remain the same
+
+def get_position_details(symbol, entry_price, position_type, position_entry_times):
+    """Retrieve position details. (Unchanged)"""
     try:
-        ohlcv = exchange.fetch_ohlcv(market_id, timeframe=timeframe, limit=limit)
+        with position_details_lock:
+            if symbol in position_details: return position_details[symbol].copy()
+        # Default values (unchanged)
+        default_details = { 'entry_price': entry_price, 'stop_loss': entry_price * (0.997 if position_type == 'long' else 1.003), 'target': entry_price * (1.006 if position_type == 'long' else 0.994), 'position_type': position_type, 'entry_reason': 'Unknown', 'probability': 0.5, 'entry_time': position_entry_times.get(symbol, time.time()), 'highest_reached': entry_price if position_type == 'long' else None, 'lowest_reached': entry_price if position_type == 'short' else None, }
+        with position_details_lock:
+            if symbol not in position_details: position_details[symbol] = default_details
+            return position_details[symbol].copy()
     except Exception as e:
-        logging.exception(f"Error fetching OHLCV for {market_id}: {e}")
-        return pd.DataFrame()
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-    df.dropna(subset=['close'], inplace=True)
-    df['close'] = pd.to_numeric(df['close'], errors='coerce')
-    df.dropna(subset=['close'], inplace=True)
-    return df
+        logger.warning(f"Error retrieving position details for {symbol}: {e}")
+        # Fallback default (unchanged)
+        return { 'entry_price': entry_price, 'stop_loss': entry_price * (0.997 if position_type == 'long' else 1.003), 'target': entry_price * (1.006 if position_type == 'long' else 0.994), 'position_type': position_type, 'entry_time': time.time() - 3600, 'highest_reached': entry_price if position_type == 'long' else None, 'lowest_reached': entry_price if position_type == 'short' else None, }
 
-def preprocess_data(df, window_size=WINDOW_SIZE, lags=[1, 2, 3], scaler=None, fit_scaler=True):
+
+def is_in_cooldown(symbol):
+    """Check if a symbol is in cooldown period. (Unchanged)"""
+    with cooldown_lock:
+        cooldown_until = symbol_cooldowns.get(symbol)
+        if cooldown_until and time.time() < cooldown_until:
+            # remaining = int((cooldown_until - time.time()) / 60)
+            # logger.debug(f"{symbol} in cooldown for {remaining} more minutes.")
+            return True
+        elif cooldown_until:
+             del symbol_cooldowns[symbol] # Cooldown expired
+    return False
+
+def can_exit_position(symbol):
+    """Check if a position has been held long enough. (Unchanged)"""
+    with cooldown_lock:
+        entry_time = position_entry_times.get(symbol)
+        if entry_time:
+            hold_time_minutes = (time.time() - entry_time) / 60
+            if hold_time_minutes < MINIMUM_HOLD_MINUTES:
+                # remaining = int(MINIMUM_HOLD_MINUTES - hold_time_minutes)
+                # logger.info(f"{symbol} position held for {hold_time_minutes:.1f} mins, minimum hold is {MINIMUM_HOLD_MINUTES} mins.")
+                return False
+    return True
+
+
+def fetch_active_symbols(exchange, num_symbols=50):
+    """Fetch top N active trading symbols using ccxt."""
     try:
-        # Check required columns
-        required_columns = ['open', 'high', 'low', 'close', 'volume']
-        for col in required_columns:
-            if col not in df.columns:
-                raise KeyError(f"Dataframe missing required column: {col}")
-        df = df.dropna(subset=['close'])
-        df['close'] = pd.to_numeric(df['close'], errors='coerce')
-        df.dropna(subset=['close'])
+        # Use ccxt's fetch_tickers
+        tickers = exchange.fetch_tickers()
+        if not tickers:
+            logger.error("Failed to fetch tickers.")
+            return []
 
-        # Continuous features
-        df['EMA_20'] = ta.ema(df['close'], length=20)
-        df['EMA_50'] = ta.ema(df['close'], length=50)
-        df['RSI_14'] = ta.rsi(df['close'], length=14)
-        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-        df['MACD'] = macd['MACD_12_26_9']
-        df['MACD_Signal'] = macd['MACDs_12_26_9']
-        df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        bollinger = ta.bbands(df['close'], length=20, std=2)
-        df['BB_PCT'] = bollinger['BBP_20_2.0']
-        df['OBV'] = ta.obv(df['close'], df['volume'])
-        df['CMF'] = ta.cmf(df['high'], df['low'], df['close'], df['volume'])
+        # Load markets to filter by USDT perpetual swaps
+        markets = exchange.load_markets()
+        
+        # Filter symbols: USDT settled, perpetual swap, has ticker info, doesn't contain BTC/ETH
+        # Note: ccxt symbol format might be 'BTC/USDT:USDT' for perpetuals
+        filtered_symbols = []
+        for symbol, ticker_data in tickers.items():
+             market_info = markets.get(symbol)
+             # Check if market_info exists and meets criteria
+             if (market_info and
+                 market_info.get('settle') == 'USDT' and
+                 market_info.get('swap') and # Checks if it's a swap
+                 market_info.get('linear') and # Often used for USDT margined
+                 'USDT' in symbol and # Ensure USDT pair
+                 'quoteVolume' in ticker_data and ticker_data['quoteVolume'] is not None): # Has volume data
+                 # Check base currency isn't BTC or ETH
+                 base_currency = market_info.get('base')
+                 if base_currency and base_currency not in ['BTC', 'ETH']:
+                      # Use the symbol format expected by the rest of the bot (e.g., 'ADA/USDT:USDT')
+                      # The indicator and order placement need the correct ccxt symbol.
+                      # However, websockets might use a different format (e.g., 'ADAUSDT'). We need consistency.
+                      # Let's assume ccxt format is primary for now.
+                      filtered_symbols.append(symbol)
 
-        # Binary features
-        df['EMA_20_Cross_EMA_50'] = np.where(
-            (df['EMA_20'] > df['EMA_50']) & (df['EMA_20'].shift(1) <= df['EMA_50'].shift(1)), 1,
-            np.where((df['EMA_20'] < df['EMA_50']) & (df['EMA_20'].shift(1) >= df['EMA_50'].shift(1)), -1, 0)
+
+        # Sort by quote volume
+        top_symbols = sorted(
+            filtered_symbols,
+            key=lambda s: tickers[s].get('quoteVolume', 0),
+            reverse=True
         )
-        df['EMA_20_GT_EMA_50'] = (df['EMA_20'] > df['EMA_50']).astype(int)
-        stoch_rsi = ta.stochrsi(df['close'])
-        df['StochRSI_K'] = stoch_rsi['STOCHRSIk_14_14_3_3']
-        df['StochRSI_D'] = stoch_rsi['STOCHRSId_14_14_3_3']
-        df['StochRSI_Cross_D'] = np.where(
-            (df['StochRSI_K'] > df['StochRSI_D']) & (df['StochRSI_K'].shift(1) <= df['StochRSI_D'].shift(1)), 1,
-            np.where((df['StochRSI_K'] < df['StochRSI_D']) & (df['StochRSI_K'].shift(1) >= df['StochRSI_D'].shift(1)), -1, 0)
-        )
-        df['RSI_Overbought'] = (df['RSI_14'] > 70).astype(int)
-        df['RSI_Oversold'] = (df['RSI_14'] < 30).astype(int)
-        df['BB_Overextended'] = ((df['BB_PCT'] > 1) | (df['BB_PCT'] < 0)).astype(int)
 
-        df.dropna(inplace=True)
+        logger.info(f"Fetched {len(filtered_symbols)} active USDT perpetuals (excluding BTC/ETH). Top {num_symbols} by volume selected.")
+        return top_symbols[:num_symbols]
 
-        # Feature list
-        features = [
-            'close', 'EMA_20', 'EMA_50', 'RSI_14', 'MACD', 'MACD_Signal', 'ATR', 'BB_PCT', 'OBV', 'CMF',
-            'EMA_20_Cross_EMA_50', 'EMA_20_GT_EMA_50', 'StochRSI_Cross_D', 'RSI_Overbought', 'RSI_Oversold', 'BB_Overextended'
-        ]
+    except ccxt.NetworkError as e:
+         logger.error(f"Network error fetching active symbols: {e}")
+         return []
+    except Exception as e:
+        logger.exception(f"Error fetching active symbols: {e}")
+        return []
 
-        # Compute lagged features
-        lagged_dfs = {lag: df[features].shift(lag).add_suffix(f'_lag{lag}') for lag in lags}
-        df_lagged = pd.concat([df[features]] + list(lagged_dfs.values()), axis=1)
-        df_lagged.dropna(inplace=True)
+def get_leverage_for_market(exchange, market_id, leverage_options=LEVERAGE_OPTIONS):
+    """Set and get leverage using ccxt."""
+    # ccxt uses set_leverage(leverage, symbol)
+    try:
+        # First, try to fetch current leverage if API supports it (often not standard)
+        # If not, iterate and set
+        for leverage in leverage_options:
+            try:
+                # logger.debug(f"Attempting to set leverage {leverage} for {market_id}")
+                exchange.set_leverage(leverage, market_id)
+                # Verify? Some exchanges return confirmation, others don't reliably
+                # We assume success if no exception is thrown
+                logger.info(f"Set leverage to {leverage} for {market_id}")
+                return leverage
+            except ccxt.ExchangeError as e:
+                 # Handle specific errors like "leverage not modified" which might be okay
+                 if "leverage not modified" in str(e).lower():
+                      logger.info(f"Leverage already set to {leverage} for {market_id} (or cannot be modified).")
+                      # How to confirm the *actual* current leverage? fetch_position might show it.
+                      # For now, assume this means the leverage is acceptable. Return it.
+                      # Re-fetch position after setting might be needed for verification.
+                      return leverage
+                 logger.warning(f"Could not set leverage {leverage} for {market_id}: {e}")
+                 continue # Try next lower leverage
+            except Exception as e:
+                 logger.warning(f"Non-ExchangeError setting leverage {leverage} for {market_id}: {e}")
+                 continue
 
-        # Scaling and sequence creation
-        all_features = df_lagged.columns.tolist()
-        data = df_lagged.values
-        if scaler is None or fit_scaler or (scaler is not None and scaler.scale_.shape[0] != data.shape[1]):
-            scaler = RobustScaler()
-            data_scaled = scaler.fit_transform(data)
+        logger.error(f"Failed to set any leverage from {leverage_options} for {market_id}")
+        return None # Failed to set any leverage
+    except Exception as e:
+        logger.exception(f"General error setting leverage for {market_id}: {e}")
+        return None
+
+def fetch_open_positions(exchange):
+    """Fetch open positions using ccxt."""
+    try:
+        # Ensure market data is loaded for mapping symbols if needed
+        if not exchange.markets:
+            exchange.load_markets()
+
+        # Fetch positions (may need symbol=None or specific symbols depending on needs)
+        # Passing no symbol usually fetches all positions for the account type
+        positions = exchange.fetch_positions(symbols=None) # Fetch all relevant positions
+
+        # Filter for positions with non-zero size
+        open_positions = {}
+        for pos in positions:
+            # ccxt standard format includes 'contracts', 'contractSize', 'side', 'unrealizedPnl' etc.
+            # Check for non-zero position size. 'contracts' is often the field.
+            position_size = pos.get('contracts', 0.0)
+            if position_size is None: position_size = 0.0 # Handle None case
+
+            # Also check 'info' dict for exchange-specific amount if 'contracts' is zero/None
+            if abs(position_size) < 1e-9 and 'info' in pos: # Precision check
+                position_size = float(pos['info'].get('positionAmt', 0.0)) # Common Binance field
+
+            if abs(position_size) > 1e-9: # Use a small threshold for floating point
+                 symbol = pos.get('symbol')
+                 if symbol:
+                     # Store in a format consistent with original structure if needed
+                     # Or just store the whole ccxt position object
+                     open_positions[symbol] = {
+                         'symbol': symbol,
+                         'size': position_size, # Store the determined size
+                         'side': 'long' if position_size > 0 else 'short',
+                         'entry_price': pos.get('entryPrice'),
+                         'leverage': pos.get('leverage'),
+                         'ccxt_object': pos # Store the full object for later use
+                         # Keep original nested 'info' structure if place_order/exit relies on it heavily
+                         # 'info': {'positionAmt': str(position_size), 'entryPrice': str(pos.get('entryPrice'))}
+                     }
+                 else:
+                      logger.warning(f"Position found with non-zero size but missing symbol: {pos}")
+
+        # logger.debug(f"Fetched {len(open_positions)} open positions.")
+        return open_positions
+
+    except ccxt.NetworkError as e:
+         logger.error(f"Network error fetching positions: {e}")
+         return {}
+    except ccxt.ExchangeError as e:
+         logger.error(f"Exchange error fetching positions: {e}")
+         return {}
+    except Exception as e:
+        logger.exception(f"Unexpected error fetching positions: {e}")
+        return {}
+
+# Order placement and quantity calculation (Largely unchanged, uses ccxt)
+def place_order(exchange, market_id, side, quantity, price, leverage=None, exit_order=False,
+               stop_loss=None, target_price=None, place_target_order=True, skip_cooldown=False):
+    """Place an order using ccxt with SL/TP handling."""
+    # Use ccxt's create_order and parameter conventions
+    order_type = 'MARKET' # Use market orders for entry/exit
+    params = {}
+    order_placed_successfully = False
+    market_order_info = None # To store result from create_order
+
+    if exit_order:
+        params['reduceOnly'] = True
+
+    try:
+        # Pre-flight checks (Unchanged logic)
+        if not exit_order and place_target_order:
+            if stop_loss is None or target_price is None:
+                 logger.error(f"Cannot place entry for {market_id}: Missing SL/TP.")
+                 return None
+            # Basic validation (prices make sense relative to current 'price')
+            min_dist = price * 0.0005 # 0.05% minimum distance
+            if side == 'buy': # Long
+                if stop_loss >= price - min_dist: logger.error(f"Invalid SL {stop_loss} for {market_id} LONG @ {price}. Too close or above entry."); return None
+                if target_price <= price + min_dist: logger.error(f"Invalid TP {target_price} for {market_id} LONG @ {price}. Too close or below entry."); return None
+            else: # Short
+                if stop_loss <= price + min_dist: logger.error(f"Invalid SL {stop_loss} for {market_id} SHORT @ {price}. Too close or below entry."); return None
+                if target_price >= price - min_dist: logger.error(f"Invalid TP {target_price} for {market_id} SHORT @ {price}. Too close or above entry."); return None
+
+
+        # Use price_to_precision and amount_to_precision
+        market = exchange.markets[market_id]
+        precise_quantity = exchange.amount_to_precision(market_id, quantity)
+        
+        # Check against minimum amount and cost
+        min_amount = market['limits']['amount']['min']
+        min_cost = market['limits']['cost']['min']
+        
+        if float(precise_quantity) < min_amount:
+             logger.warning(f"Quantity {precise_quantity} for {market_id} below minimum {min_amount}. Adjusting...")
+             precise_quantity = exchange.amount_to_precision(market_id, min_amount) # Adjust to min amount
+             # Recalculate cost with adjusted quantity
+             current_cost = float(precise_quantity) * price
         else:
-            data_scaled = scaler.transform(data)
-        X, y = [], []
-        target_index = all_features.index("close")
-        for i in range(window_size, len(data_scaled) - PREDICTION_HORIZON):
-            X.append(data_scaled[i - window_size:i])
-            future_close_prices = data_scaled[i:i + PREDICTION_HORIZON, target_index]
-            y.append(future_close_prices)
-        return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32), scaler
+             current_cost = float(precise_quantity) * price
 
+        if min_cost is not None and current_cost < min_cost:
+             logger.error(f"Order cost {current_cost:.2f} for {market_id} below minimum {min_cost:.2f}. Cannot place order.")
+             # Attempt to increase quantity to meet min_cost? Risky, changes position size. Abort for safety.
+             return None
+
+
+        logger.info(f"Attempting {side.upper()} {'exit' if exit_order else 'entry'} order: {market_id}, Type: {order_type}, Qty: {precise_quantity}")
+
+        # Place the main market order
+        market_order = exchange.create_order(market_id, order_type, side, precise_quantity, price=None, params=params)
+        # Price = None for market orders
+
+        market_order_info = market_order # Store the response
+        order_id = market_order.get('id', 'N/A')
+        avg_price = market_order.get('average', price) # Use average fill price if available
+
+        logger.info(f"Market order {order_id} placed for {market_id}: {side} {precise_quantity}. Avg Price: {avg_price}")
+        order_placed_successfully = True
+
+        # Post-entry/exit logic (Unchanged logic flow)
+        if not exit_order:
+            with cooldown_lock: position_entry_times[market_id] = time.time()
+            logger.info(f"Position entry time recorded for {market_id}")
+            if place_target_order:
+                time.sleep(1.5) # Allow market order to fill
+                # Pass the potentially filled average price to SL/TP placement if needed?
+                # But SL/TP triggers are based on levels, not entry price directly.
+                place_sl_tp_orders(exchange, market_id, side, precise_quantity, stop_loss, target_price)
+        else: # Exit order placed
+            if not skip_cooldown:
+                with cooldown_lock:
+                    cooldown_end_time = time.time() + SYMBOL_COOLDOWN_MINUTES * 60
+                    symbol_cooldowns[market_id] = cooldown_end_time
+                    if market_id in position_entry_times: del position_entry_times[market_id]
+                logger.info(f"Setting cooldown for {market_id} until: {time.strftime('%H:%M:%S', time.localtime(cooldown_end_time))}")
+            else:
+                logger.info(f"Skipping cooldown for {market_id}")
+
+        return market_order_info # Return the order details dict
+
+    except ccxt.InsufficientFunds as e:
+         log_trade_metrics('order_placement_errors')
+         logger.error(f"Insufficient funds to place {side} order for {market_id}: {e}")
+         # Clean up local state if entry failed
+         if not exit_order and not order_placed_successfully:
+             with position_details_lock:
+                 if market_id in position_details: del position_details[market_id]
+             with cooldown_lock:
+                  if market_id in position_entry_times: del position_entry_times[market_id]
+         return None
+    except ccxt.ExchangeError as e:
+        log_trade_metrics('order_placement_errors')
+        logger.error(f"Exchange error placing order for {market_id}: {e}")
+        if not exit_order and not order_placed_successfully:
+             with position_details_lock:
+                 if market_id in position_details: del position_details[market_id]
+             with cooldown_lock:
+                  if market_id in position_entry_times: del position_entry_times[market_id]
+        return None
     except Exception as e:
-        logging.exception(f"Error in preprocessing data: {e}")
-        return np.array([]), np.array([]), None
-
-def inverse_close(normalized_close, scaler):
-    try:
-        dummy = np.zeros((len(normalized_close), len(scaler.scale_)))
-        dummy[:, 3] = normalized_close
-        inv = scaler.inverse_transform(dummy)
-        return inv[:, 3]
-    except Exception as e:
-        logging.exception(f"Error in inverse transforming 'close': {e}")
-        return normalized_close
-
-# ------------------ Model Building Functions ------------------
-
-def build_model_with_params(model_params, input_shape, sequence_length):
-    try:
-        inputs = Input(shape=input_shape)
-        
-        # First LSTM layer with return sequences
-        x = LSTM(
-            model_params.get('lstm_units1', 64),
-            return_sequences=True,
-            recurrent_dropout=0.1
-        )(inputs)
-        x = Dropout(model_params.get('dropout_rate', 0.3))(x)
-        
-        # Replace standard Attention with LearnableBiasedAttention
-        attention = LearnableBiasedAttention(sequence_length=sequence_length)([x, x])
-        
-        # Second LSTM layer with return sequences
-        x = LSTM(
-            model_params.get('lstm_units2', 32),
-            return_sequences=True,
-            recurrent_dropout=0.1
-        )(attention)
-        x = Dropout(model_params.get('dropout_rate', 0.3))(x)
-        
-        # Third LSTM layer without return sequences
-        x = LSTM(
-            model_params.get('lstm_units3', 16),
-            return_sequences=False
-        )(x)
-        x = Dropout(model_params.get('dropout_rate', 0.3))(x)
-        
-        # Output layer
-        outputs = Dense(PREDICTION_HORIZON, activation='tanh')(x)
-        
-        model = Model(inputs, outputs)
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-            loss='mse',
-            metrics=['mae']
-        )
-        return model
-    except Exception as e:
-        logging.exception(f"Error building model with params {model_params}: {e}")
+        log_trade_metrics('order_placement_errors')
+        logger.exception(f"Unexpected error placing order for {market_id}: {e}")
+        if not exit_order and not order_placed_successfully:
+             with position_details_lock:
+                 if market_id in position_details: del position_details[market_id]
+             with cooldown_lock:
+                  if market_id in position_entry_times: del position_entry_times[market_id]
         return None
 
-def build_model(input_shape, sequence_length, model_params=DEFAULT_MODEL_PARAMS):
-    return build_model_with_params(model_params, input_shape, sequence_length)
-    
+def place_sl_tp_orders(exchange, market_id, entry_side, quantity, stop_loss, target_price, retries=2):
+    """Place SL/TP orders using ccxt unified stop methods."""
+    if stop_loss is None or target_price is None:
+        logger.error(f"Missing SL ({stop_loss}) or TP ({target_price}) for {market_id}.")
+        return False
 
-# ------------------ Self-Improvement Functions ------------------
+    inverted_side = 'sell' if entry_side == 'buy' else 'buy'
+    precise_quantity = exchange.amount_to_precision(market_id, quantity)
+    precise_sl = exchange.price_to_precision(market_id, stop_loss)
+    precise_tp = exchange.price_to_precision(market_id, target_price)
 
-# ------------------ Automated Hyperparameter Tuning with Optuna ------------------
+    sl_order_id = None
+    tp_order_id = None
+    success = False
 
-def self_improve_model(current_model, X, y, scaler, current_params):
-    """
-    Automated hyperparameter tuning for the LSTM model using Optuna.
-    This function splits the provided data, defines an objective function for Optuna,
-    and returns the best model and parameters found.
-    """
-    logging.info("Starting automated hyperparameter tuning with Optuna for LSTM model")
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
-    input_shape = X.shape[1:]  # (window_size, num_features)
-    
-    def objective(trial):
-        tf.keras.backend.clear_session()
-        # Define hyperparameters to tune
-        lstm_units1 = trial.suggest_int("lstm_units1", 32, 128, step=16)
-        lstm_units2 = trial.suggest_int("lstm_units2", 16, 64, step=8)
-        lstm_units3 = trial.suggest_int("lstm_units3", 16, 32, step=8)
-        dropout_rate = trial.suggest_float("dropout_rate", 0.1, 0.5, step=0.1)
-        learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
-        epochs = trial.suggest_int("epochs", 5, 15)
-        
-        # Build model with the sampled hyperparameters
-        trial_params = {
-            "lstm_units1": lstm_units1,
-            "lstm_units2": lstm_units2,
-            "lstm_units3": lstm_units3,
-            "dropout_rate": dropout_rate
+    # Ensure SL/TP prices are valid relative to each other
+    if entry_side == 'buy' and float(precise_sl) >= float(precise_tp):
+         logger.error(f"Invalid SL/TP for {market_id} LONG: SL {precise_sl} >= TP {precise_tp}. Aborting SL/TP placement.")
+         return False
+    if entry_side == 'sell' and float(precise_sl) <= float(precise_tp):
+         logger.error(f"Invalid SL/TP for {market_id} SHORT: SL {precise_sl} <= TP {precise_tp}. Aborting SL/TP placement.")
+         return False
+
+
+    # Use create_order with 'STOP_MARKET' and 'TAKE_PROFIT_MARKET' types
+    # Specify stopPrice in params
+    try:
+        # Place Stop Loss (STOP_MARKET)
+        sl_params = {
+            'stopPrice': precise_sl,
+            'reduceOnly': True,
+            # 'timeInForce': 'GTE_GTC', # May not be needed/supported for STOP_MARKET with stopPrice
         }
-        model = build_model_with_params(trial_params, input_shape, sequence_length=WINDOW_SIZE)
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate), loss='mse', metrics=['mae'])
-        
-        # Train the model
-        callbacks = [EarlyStopping(monitor='val_loss', patience=3, min_delta=1e-4, restore_best_weights=True, verbose=0)]
-        model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=epochs, batch_size=32, verbose=0, callbacks=callbacks)
-        # Evaluate and return validation loss
-        val_loss = model.evaluate(X_val, y_val, verbose=0)[0]
-        return val_loss
+        logger.info(f"Placing SL Order: {market_id}, Type: STOP_MARKET, Side: {inverted_side}, Qty: {precise_quantity}, StopPx: {precise_sl}")
+        sl_order = exchange.create_order(market_id, 'STOP_MARKET', inverted_side, precise_quantity, price=None, params=sl_params)
+        sl_order_id = sl_order.get('id')
+        logger.info(f"SL order {sl_order_id} placed for {market_id} at stop {precise_sl}")
 
-    study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=10)
-    best_params = study.best_trial.params
-    best_loss = study.best_value
-    logging.info(f"Optuna found best parameters: {best_params} with loss: {best_loss:.4f}")
-    
-    # Rebuild the model using the best hyperparameters
-    best_model = build_model_with_params(best_params, input_shape, sequence_length=WINDOW_SIZE)
-    best_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_params.get("learning_rate", 0.001)), loss='mse', metrics=['mae'])
-    best_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=10, batch_size=32, verbose=0, callbacks=[
-         EarlyStopping(monitor="val_loss", patience=3, min_delta=1e-4, restore_best_weights=True, verbose=0)
-    ])
-    return best_model, best_params
+        time.sleep(0.5) # Brief pause
 
-# ------------------ Meta-Learner Functions ------------------
+        # Place Take Profit (TAKE_PROFIT_MARKET)
+        tp_params = {
+            'stopPrice': precise_tp, # stopPrice acts as the trigger for take profit market
+            'reduceOnly': True,
+            # 'timeInForce': 'GTE_GTC',
+        }
+        logger.info(f"Placing TP Order: {market_id}, Type: TAKE_PROFIT_MARKET, Side: {inverted_side}, Qty: {precise_quantity}, StopPx: {precise_tp}")
+        tp_order = exchange.create_order(market_id, 'TAKE_PROFIT_MARKET', inverted_side, precise_quantity, price=None, params=tp_params)
+        tp_order_id = tp_order.get('id')
+        logger.info(f"TP order {tp_order_id} placed for {market_id} at trigger {precise_tp}")
 
-def build_meta_learner(input_dim):
-    try:
-        model = Sequential()
-        model.add(Dense(16, activation='relu', input_dim=input_dim))
-        model.add(Dense(8, activation='relu'))
-        model.add(Dense(1, activation='tanh'))
-        model.compile(optimizer='adam', loss='mse')
-        return model
+        success = True
+
+    except ccxt.ExchangeError as e:
+         # Attempt to cancel the one that might have succeeded if the other failed
+         logger.error(f"Exchange error placing SL/TP for {market_id}: {e}")
+         if sl_order_id and not tp_order_id: # SL placed, TP failed
+             logger.warning(f"TP order failed for {market_id}, attempting to cancel SL order {sl_order_id}")
+             try: exchange.cancel_order(sl_order_id, market_id)
+             except Exception as cancel_e: logger.error(f"Failed to cancel SL order {sl_order_id}: {cancel_e}")
+         elif not sl_order_id and tp_order_id: # SL failed, TP placed (less likely sequence)
+              logger.warning(f"SL order failed for {market_id}, attempting to cancel TP order {tp_order_id}")
+              try: exchange.cancel_order(tp_order_id, market_id)
+              except Exception as cancel_e: logger.error(f"Failed to cancel TP order {tp_order_id}: {cancel_e}")
+         # Log metric if placing failed
+         if not success: log_trade_metrics('order_placement_errors')
+         return False # Indicate failure
+
     except Exception as e:
-        logging.exception(f"Error building meta-learner with input_dim {input_dim}: {e}")
-        return None
+        logger.exception(f"Unexpected error placing SL/TP orders for {market_id}: {e}")
+        # Add cancellation logic here too if needed
+        if not success: log_trade_metrics('order_placement_errors')
+        return False
 
-# For simplicity the meta-learner remains global
-baap_meta_learner = None
-BAAP_META_FILENAME = "baap_meta_model.keras"
+    # Store order IDs if successful
+    if success:
+         with position_details_lock:
+             if market_id in position_details:
+                 position_details[market_id]['sl_order_id'] = sl_order_id
+                 position_details[market_id]['tp_order_id'] = tp_order_id
+                 logger.debug(f"Stored SL/TP order IDs ({sl_order_id}, {tp_order_id}) for {market_id}")
+         return True
+    else:
+         return False
 
-# ------------------ Continuous Trading Loop ------------------
+
+def get_order_quantity(exchange, market_id, price, leverage):
+    """Calculate order quantity using ccxt market info. (Unchanged logic)"""
+    try:
+        market = exchange.markets[market_id]
+        min_notional = market['limits']['cost']['min'] if market['limits'].get('cost') else None
+        min_quantity = market['limits']['amount']['min'] if market['limits'].get('amount') else 0.0
+
+        # Calculate initial quantity
+        quantity = (AMOUNT_USD * leverage) / price
+
+        # Adjust for minimum notional if applicable
+        if min_notional is not None:
+            notional_value = quantity * price
+            if notional_value < min_notional:
+                quantity = (min_notional / price) * 1.01 # Add 1% buffer
+                logger.info(f"Adjusted quantity for {market_id} to meet min notional {min_notional}. New Qty: ~{quantity}")
+
+        # Ensure minimum quantity is met
+        if quantity < min_quantity:
+             logger.info(f"Adjusted quantity for {market_id} from {quantity} to meet min amount {min_quantity}.")
+             quantity = min_quantity
+
+        # Return the calculated quantity (precision applied in place_order)
+        return quantity
+
+    except KeyError as e:
+         logger.error(f"Market data error for {market_id}: Missing key {e}. Cannot calculate quantity.")
+         return 0.0
+    except Exception as e:
+        logger.exception(f"Error calculating quantity for {market_id}: {e}")
+        return 0.0
+
+# is_market_suitable can be adapted to use WS data (e.g. ticker volume, kline range)
+def is_market_suitable(symbol):
+    """ Check market suitability using data from WS streams (ticker, klines) """
+    try:
+        # Get data from WS caches
+        with ticker_lock:
+             ticker = latest_ticker_data.get(symbol)
+        df = get_kline_df(symbol) # Gets DataFrame from deque
+
+        if ticker is None or df.empty or len(df) < 20:
+            # logger.debug(f"Insufficient data for suitability check: {symbol} (Ticker: {ticker is not None}, Candles: {len(df)})")
+            return False # Need recent ticker and sufficient klines
+
+        # Use last N klines for volatility check (e.g., last 30 minutes on 1m or equiv on 3m)
+        # If using 3m klines, maybe use last 10-15 candles (30-45 mins)
+        recent_klines = df.tail(15)
+        if len(recent_klines) < 5: return False # Need at least a few recent candles
+
+        mean_close = recent_klines['close'].mean()
+        if mean_close <= 0 or pd.isna(mean_close):
+            logger.warning(f"{symbol} has invalid price data in recent klines.")
+            return False
+
+        # 1. Price Range Check (using recent klines High/Low)
+        price_range_pct = ((recent_klines['high'].max() - recent_klines['low'].min()) / mean_close) * 100
+        min_range, max_range = 0.2, 5.0 # Existing thresholds
+        if not (min_range <= price_range_pct <= max_range):
+             # logger.debug(f"Market {symbol} unsuitable: Price range {price_range_pct:.2f}% outside [{min_range}%, {max_range}%]")
+             return False
+
+        # 2. Volume Check (using ticker 24h volume or recent kline volume)
+        # Option A: Use 24h Quote Volume from Ticker (simpler)
+        quote_volume_24h = ticker.get('quote_volume')
+        min_quote_volume = 500000 # Example threshold: $500k daily volume
+        if quote_volume_24h is None or quote_volume_24h < min_quote_volume:
+            # logger.debug(f"Market {symbol} unsuitable: 24h Quote Volume {quote_volume_24h} < {min_quote_volume}")
+            return False
+
+        # Option B: Volume stability from recent klines (like original)
+        # volume_data = recent_klines['volume'].replace(0, np.nan).dropna()
+        # if len(volume_data) < 5: return False
+        # volume_mean = volume_data.mean()
+        # volume_std = volume_data.std()
+        # if volume_mean <= 1e-9: return False
+        # volume_stability = volume_std / volume_mean if volume_mean > 0 else float('inf')
+        # max_vol_stability = 1.5
+        # if volume_stability > max_vol_stability:
+        #     logger.debug(f"Market {symbol} unsuitable: Volume stability {volume_stability:.2f} > {max_vol_stability}")
+        #     return False
+
+        # If all checks pass
+        # logger.debug(f"Market {symbol} suitable.")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Error checking market suitability for {symbol}: {e}", exc_info=False)
+        return False
+
+def sync_positions_with_exchange(exchange):
+    """Synchronize local position tracking with exchange. (Unchanged logic)"""
+    logger.info("Synchronizing positions with exchange...")
+    try:
+        exchange_positions = fetch_open_positions(exchange) # Uses updated fetch_open_positions
+        exchange_symbols = set(exchange_positions.keys())
+
+        with position_details_lock: local_symbols = set(position_details.keys())
+
+        closed_locally = local_symbols - exchange_symbols
+        for symbol in closed_locally:
+            logger.warning(f"Position for {symbol} closed on exchange but still tracked locally. Removing.")
+            with position_details_lock:
+                 if symbol in position_details: del position_details[symbol]
+            with cooldown_lock: # Also clear related cooldown/entry times
+                 if symbol in symbol_cooldowns: del symbol_cooldowns[symbol]
+                 if symbol in position_entry_times: del position_entry_times[symbol]
+
+
+        new_on_exchange = exchange_symbols - local_symbols
+        for symbol in new_on_exchange:
+            logger.warning(f"Position for {symbol} found on exchange but not tracked locally. Adding 'Recovery' entry.")
+            position = exchange_positions[symbol]
+            entry_price = position.get('entry_price')
+            position_size = position.get('size')
+
+            if entry_price is None or position_size is None:
+                 logger.error(f"Cannot recover position {symbol}: Missing entry price or size from exchange data.")
+                 continue
+
+            position_type = 'long' if position_size > 0 else 'short'
+
+            # Create default details for recovery
+            with position_details_lock:
+                position_details[symbol] = {
+                    'entry_price': entry_price,
+                    'stop_loss': entry_price * (0.98 if position_type == 'long' else 1.02), # Wider default SL
+                    'target': entry_price * (1.04 if position_type == 'long' else 0.96), # Wider default TP
+                    'position_type': position_type,
+                    'entry_reason': 'Recovery', 'probability': 0.5,
+                    'entry_time': time.time() - 3600, # Assume 1 hour ago
+                    'highest_reached': entry_price if position_type == 'long' else None,
+                    'lowest_reached': entry_price if position_type == 'short' else None,
+                    'signal_type': 'Recovery',
+                    # Ensure leverage is stored if available
+                    'leverage': position.get('leverage')
+                }
+
+            # Log the recovered position entry
+            recovery_log = {
+                 'entry_price': entry_price, 'stop_loss': position_details[symbol]['stop_loss'],
+                 'target': position_details[symbol]['target'], 'entry_reason': 'Recovery',
+                 'position_type': position_type, 'position_status': 'Open (Recovery)',
+                 'leverage': position.get('leverage')
+            }
+            log_trade(symbol, recovery_log) # Queue log
+
+        logger.info(f"Position synchronization complete. Exchange: {len(exchange_symbols)}, Local: {len(position_details)}")
+
+    except Exception as e:
+        logger.exception(f"Error synchronizing positions: {e}")
+
+
+# --- Main Trading Loop (Refactored for WebSocket Data) ---
+
+def check_ws_data_freshness(symbol, max_staleness=60):
+     """ Check if WS data for symbol is recent """
+     with ws_update_time_lock:
+         last_update = last_ws_update_time.get(symbol, 0)
+     if time.time() - last_update > max_staleness:
+         logger.warning(f"WebSocket data for {symbol} is stale (last update {time.time() - last_update:.0f}s ago).")
+         return False
+     return True
 
 def continuous_loop(exchange):
-    global baap_meta_learner
-    
-    # Initialize the meta-learner (remains common for all markets)
-    if os.path.exists(BAAP_META_FILENAME):
+    """ Main loop using WebSocket data and periodic OI polling. """
+    last_metrics_time = time.time()
+    last_oi_fetch_time = 0
+    oi_fetch_interval = 45 # Seconds between OI fetches
+
+    # Track symbols being actively monitored by WS
+    monitored_symbols = set()
+    with kline_lock: monitored_symbols.update(latest_kline_data.keys())
+    with depth_lock: monitored_symbols.update(latest_depth_data.keys())
+    with ticker_lock: monitored_symbols.update(latest_ticker_data.keys())
+
+
+    while not file_writer_stop_event.is_set(): # Check stop event
         try:
-            baap_meta_learner_local = tf.keras.models.load_model(BAAP_META_FILENAME)
-            baap_meta_learner = baap_meta_learner_local
-        except Exception as e:
-            logging.warning(f"Failed to load baap_meta_learner: {e}")
-            baap_meta_learner = build_meta_learner(NUM_MC_SAMPLES * PREDICTION_HORIZON)
-    else:
-        baap_meta_learner = build_meta_learner(NUM_MC_SAMPLES * PREDICTION_HORIZON)
+            current_time = time.time()
 
-    while True:
-        try:
-            logging.info("=== Starting new trading cycle ===")
-            try:
-                active_markets = fetch_active_symbols(exchange)
-            except Exception as e:
-                logging.exception(f"Failed to fetch active symbols: {e}")
-                time.sleep(SLEEP_INTERVAL)
-                continue
-            if not active_markets:
-                logging.error("No active markets found.")
-                time.sleep(SLEEP_INTERVAL)
-                continue
-            try:
-                open_positions_map = fetch_open_positions(exchange)
-            except Exception as e:
-                logging.exception(f"Failed to fetch open positions: {e}")
-                open_positions_map = {}
-            for unified_symbol, market_id in active_markets:
-                try:
-                    if len(open_positions_map) >= MAX_OPEN_TRADES and market_id not in open_positions_map:
-                        continue
-                    if market_id not in market_models or market_id not in market_scalers:
-                        model_file = get_model_filename(market_id)
-                        scaler_file = get_scaler_filename(market_id)
-                        if os.path.exists(model_file) and os.path.exists(scaler_file):
-                            try:
-                                model = tf.keras.models.load_model(model_file)
-                                with open(scaler_file, 'rb') as f:
-                                    scaler = pickle.load(f)
-                                market_models[market_id] = model
-                                market_scalers[market_id] = scaler
-                            except Exception as e:
-                                logging.error(f"Error loading model/scaler for {market_id}: {e}")
-                                continue
-                        else:
-                            # Enqueue historical training if conditions allow
-                            with training_lock:
-                                if (market_id not in training_in_progress and 
-                                    len(open_positions_map) < MAX_OPEN_TRADES):
-                                    try:
-                                        historical_training_queue.put(
-                                            {'market_id': market_id, 'is_historical': True},
-                                            block=False
-                                        )
-                                        training_in_progress.add(market_id)
-                                        logging.info(f"Enqueued historical training task for {market_id}")
-                                    except queue.Full:
-                                        logging.warning(f"Training queue full. Cannot enqueue {market_id}")
-                            continue
-                    else:
-                        model = market_models[market_id]
-                        scaler = market_scalers[market_id]
-                    # Fetch and process live data
-                    df_live = fetch_binance_data(market_id, timeframe=TIMEFRAME, limit=LIMIT)
-                    df_live.dropna(inplace=True)
-                    if df_live.empty:
-                        logging.warning(f"Not enough live data for {market_id}. Skipping...")
-                        continue
-                    # now = pd.Timestamp.now(tz='UTC')
-                    # try:
-                    #     timeframe_minutes = int(TIMEFRAME.rstrip('m'))
-                    # except Exception:
-                    #     timeframe_minutes = 3
-                    # candle_duration = pd.Timedelta(minutes=timeframe_minutes)
-                    # if df_live['timestamp'].iloc[-1].tzinfo is None:
-                    #     df_live['timestamp'] = df_live['timestamp'].dt.tz_localize('UTC')
-                    # if df_live['timestamp'].iloc[-1] + candle_duration > now:
-                    #     df_live = df_live.iloc[:-1]
-                    if df_live.empty:
-                        logging.warning(f"Live data for {market_id} has no closed candles. Skipping...")
-                        continue
-                    df_live['close_delta'] = df_live['close'].diff()
-                    df_live['volume_delta'] = df_live['volume'].diff()
+            # --- Periodic Tasks ---
+            if current_time - last_metrics_time > 3600: # Hourly metrics
+                log_trade_funnel()
+                # report_metrics() # Optionally report full metrics hourly too
+                last_metrics_time = current_time
 
-                    # Load or retrieve the model and scaler for this market
-                    if market_id not in market_models or market_id not in market_scalers:
-                        model_file = get_model_filename(market_id)
-                        scaler_file = get_scaler_filename(market_id)
-                        if os.path.exists(model_file) and os.path.exists(scaler_file):
-                            try:
-                                model = tf.keras.models.load_model(model_file)
-                                with open(scaler_file, 'rb') as f:
-                                    scaler = pickle.load(f)
-                                market_models[market_id] = model
-                                market_scalers[market_id] = scaler
-                            except Exception as e:
-                                logging.error(f"Error loading model/scaler for market {market_id}: {e}")
-                                continue
-                        else:
-                            logging.error(f"Model or scaler for market {market_id} not found. Skipping market.")
-                            continue
-                    else:
-                        model = market_models[market_id]
-                        scaler = market_scalers[market_id]
+            # Fetch Open Interest for all monitored symbols periodically
+            if current_time - last_oi_fetch_time > oi_fetch_interval:
+                logger.info(f"Fetching Open Interest for {len(monitored_symbols)} symbols...")
+                # Create a temporary set to avoid issues if monitored_symbols changes during iteration
+                symbols_to_fetch_oi = list(monitored_symbols) 
+                for symbol in symbols_to_fetch_oi:
+                    # Fetch OI (already includes caching)
+                    _ = fetch_open_interest(exchange, symbol) 
+                    time.sleep(0.1) # Small delay between OI fetches
+                last_oi_fetch_time = current_time
+                logger.info("Open Interest fetch cycle complete.")
 
-                    X_live, y_live, scaler_live = preprocess_data(df_live, window_size=WINDOW_SIZE, scaler=scaler, fit_scaler=False)
-                    if X_live.size == 0:
-                        logging.warning(f"Not enough processed live data for {market_id}. Skipping...")
-                        continue
 
-                    last_window = X_live[-1].reshape(1, X_live.shape[1], X_live.shape[2])
-                    candidate_preds_sequences = []
-                    K.clear_session()
-                    tf.compat.v1.reset_default_graph()  # Reset TensorFlow graph
-                    for _ in range(NUM_MC_SAMPLES):
-                        try:
-                            # Enable dropout during prediction for MC sampling by setting training=True
-                            pred_sequence_norm = model.predict(last_window, verbose=0)
-                            candidate_preds_sequences.append(pred_sequence_norm.flatten())
-                        except Exception as e:
-                            logging.exception(f"Error during candidate prediction for {market_id}: {e}")
-                    if not candidate_preds_sequences:
-                        logging.warning(f"No candidate predictions for {market_id}. Skipping...")
-                        continue
-                    candidate_vectors = np.array(candidate_preds_sequences)
-                    try:
-                        meta_learner_input = candidate_vectors.reshape(1, -1)
-                        final_pred_sequence_norm = baap_meta_learner.predict(meta_learner_input).flatten()
-                    except Exception as e:
-                        logging.exception(f"Meta-learner prediction error for {market_id}: {e}")
-                        final_pred_sequence_norm = np.mean(candidate_vectors, axis=0)
-                    if np.isnan(final_pred_sequence_norm).any() or np.all(final_pred_sequence_norm == 0):
-                        final_pred_sequence_norm = np.mean(candidate_vectors, axis=0)
-                    try:
-                        last_close_norm = X_live[-1, -1, 3]
-                        last_close = inverse_close(np.array([last_close_norm]), scaler)[0]
-                        #last_close = df_live['close'].iloc[-1]
-                        predicted_close_sequence = inverse_close(final_pred_sequence_norm, scaler)
-                        # Calculate mean of predicted close sequence
-                        # mean_predicted_close = np.mean(predicted_close_sequence)
-                        # mean_pct_change = (mean_predicted_close - last_close) / last_close
-                        # Use the predicted close at the end of the horizon
-                        predicted_close_horizon = predicted_close_sequence[-1]
-                        pct_change_horizon = (predicted_close_horizon - last_close) / last_close
-                        # Calculate volatility
-                        recent_returns = df_live['close'].pct_change().dropna().tail(5)
-                        volatility = recent_returns.std() * np.sqrt(252) if not recent_returns.empty else 0.01
-                        if np.isnan(volatility) or volatility == 0:
-                            volatility = 0.01
-                        # Set base_threshold to max(0.005, volatility)
-                        base_threshold = max(0.002, volatility)
-                        dynamic_threshold = base_threshold
-                        # Determine trend direction and confidence
-                        # Determine trend direction and confidence
-                        signal = "HOLD"
-                        if pct_change_horizon > dynamic_threshold:
-                            signal = "BUY"
-                        elif pct_change_horizon < -dynamic_threshold:
-                            signal = "SELL"
-                            trend_confidence = 0.0
-                    except Exception as e:
-                        logging.exception(f"Error in inverse transforming predictions for {market_id}: {e}")
-                        continue
-                    # logging.info(f"{market_id} - Trend Direction: {trend_direction} (Confidence: {trend_confidence:.2%}), "
-                    #          f"Pct Change Horizon: {pct_change_horizon:.4f}, Volatility: {volatility:.4f}, Dynamic Threshold: {dynamic_threshold:.4f}")
-                    # (Cumulative change logic remains unchanged)
-                    if market_id not in globals().get('cumulative_pct_change', {}):
-                        cumulative_pct_change = {}
-                        globals()['cumulative_pct_change'] = cumulative_pct_change
-                    if market_id not in cumulative_pct_change:
-                        cumulative_pct_change[market_id] = 0.0
+            # --- Position Management ---
+            # Get current positions (relatively frequent check)
+            open_positions = fetch_open_positions(exchange)
+            open_symbols = list(open_positions.keys())
 
-                    # Update cumulative change with decay
-                    decay_factor = 0.9
-                    cumulative_pct_change[market_id] = (cumulative_pct_change[market_id] * decay_factor) + pct_change_horizon
-                    # signal = "HOLD"
-                    # strong_signal_threshold = dynamic_threshold * 1.2
-                    # cumulative_threshold = dynamic_threshold * 2.0
-                    # if (trend_direction == "UPWARD" and
-                    #     (pct_change_horizon > strong_signal_threshold or cumulative_pct_change[market_id] > cumulative_threshold) and
-                    #     trend_confidence > 0.9):
-                    #     signal = "SELL"
-                    #     cumulative_pct_change[market_id] = 0.0
-                    # elif (trend_direction == "DOWNWARD" and
-                    #     (abs(pct_change_horizon) > strong_signal_threshold or abs(cumulative_pct_change[market_id]) > cumulative_threshold) and
-                    #     trend_confidence > 0.9):
-                    #     signal = "BUY"
-                    #     cumulative_pct_change[market_id] = 0.0
-                    logging.info(f"{market_id} - Signal: {signal}")
-                    adverse_threshold = -0.005  # Increased to 0.5% to match stop loss
-                    exit_executed = False
-                    if market_id in open_positions_map:
-                        pos = open_positions_map[market_id]
-                        current_amt = float(pos['info'].get('positionAmt', 0))
-                        current_signal = "BUY" if current_amt > 0 else "SELL"
-                        last_close_live = df_live['close'].iloc[-1]
-                        entry_price = float(pos['info'].get('entryPrice', last_close_live))
-                        pct_change_since_entry = (last_close_live - entry_price) / entry_price if current_signal == "BUY" else (entry_price - last_close_live) / entry_price
-                        
-                        if pct_change_since_entry < adverse_threshold or (signal in ["BUY", "SELL"] and signal != current_signal):
-                            exit_side = "sell" if current_signal == "BUY" else "buy"
-                            exit_quantity = abs(current_amt)
-                            leverage = get_leverage_for_market(exchange, market_id)
-                            if leverage is None:
-                                logging.error(f"Cannot determine leverage for {market_id}. Skipping exit order.")
-                                continue
-                            logging.info(f"{market_id} - Exiting position ({current_signal}) with quantity {exit_quantity:.4f}.")
-                            exit_order = place_order(exchange, market_id, exit_side, exit_quantity, last_close_live)
-                            if exit_order:
-                                logging.info(f"{market_id} - Exit order executed.")
-                                open_positions_map.pop(market_id, None)
-                                exit_executed = True
-                            else:
-                                logging.warning(f"{market_id} - Exit order failed.")
-                    if not exit_executed and market_id not in open_positions_map and signal in ["BUY", "SELL"]:
-                        leverage = get_leverage_for_market(exchange, market_id)
-                        if leverage is None:
-                            logging.error(f"Cannot determine leverage for {market_id}. Skipping entry order.")
-                            continue
-                        
-                        last_close_live = df_live['close'].iloc[-1] 
-                        quantity = get_order_quantity(last_close_live, leverage)                       
-                        stop_loss_price = last_close_live * (0.995 if signal == "BUY" else 1.005)
-                        take_profit_price = last_close_live * (1.01 if signal == "BUY" else 0.99)
-                        logging.info(f"{market_id} - Entering new position: signal={signal}, qty={quantity:.4f}, SL={stop_loss_price:.4f}, TP={take_profit_price:.4f}.")
-                        entry_order = place_order(exchange, market_id, signal.lower(), quantity, last_close_live, stop_loss_price, take_profit_price)
-                        if entry_order:
-                            logging.info(f"{market_id} - Entry order executed.")
-                            open_positions_map[market_id] = {'symbol': market_id,
-                                                            'info': {'positionAmt': str(quantity if signal == "BUY" else -quantity),
-                                                                    'entryPrice': str(last_close_live)}}
-                        else:
-                            logging.warning(f"{market_id} - Entry order failed.")
-                    # Enqueue a training task if none is already queued.
-                    if (len(open_positions_map) < MAX_OPEN_TRADES and 
-                        market_id not in training_in_progress):
-                        with training_lock:
-                            if market_id not in training_in_progress:
-                                try:
-                                    retraining_queue.put(
-                                        {'market_id': market_id, 'X': X_live, 'y': y_live, 'scaler': scaler_live},
-                                        block=False
-                                    )
-                                    training_in_progress.add(market_id)
-                                    logging.info(f"Enqueued retraining task for {market_id}")
-                                except queue.Full:
-                                    logging.warning(f"Retraining queue full. Cannot enqueue {market_id}")
-                    else:
-                        logging.info("Training task already queued; skipping enqueue for now.")
-                    logging.info(f"{market_id} - Signal processed using its model.\n")
-                    K.clear_session()
-                except Exception as market_e:
-                    logging.exception(f"Error processing market {market_id}: {market_e}")
+            # Determine entry mode
+            entry_only_mode = len(open_positions) >= MAX_OPEN_TRADES
+
+            # --- Process Existing Positions for Exit ---
+            symbols_to_remove_from_processing = set() # Symbols exited in this cycle
+            for symbol in open_symbols:
+                if symbol not in monitored_symbols:
+                    logger.warning(f"Position exists for {symbol}, but it's not actively monitored by WebSockets. Cannot manage exit.")
+                    # Potentially start WS streams for this symbol? Or close manually?
                     continue
-            logging.info("Cycle complete for all active markets. Waiting for next cycle...\n")
-            gc.collect()
-            time.sleep(SLEEP_INTERVAL)
-        except Exception as cycle_e:
-            logging.exception(f"Unexpected error in trading cycle: {cycle_e}")
-            time.sleep(SLEEP_INTERVAL)
-            K.clear_session()
-# ------------------ Main ------------------
 
+                if not check_ws_data_freshness(symbol): continue # Skip if data stale
+
+                try:
+                    # Minimum hold time check
+                    if not can_exit_position(symbol): continue
+
+                    # Get position details from exchange fetch result
+                    position = open_positions[symbol] # Already fetched above
+                    position_amt = position['size'] # Use size from fetch_positions
+                    entry_price_from_exchange = position['entry_price']
+
+                    if abs(position_amt) < 1e-9 or entry_price_from_exchange is None:
+                         logger.warning(f"Invalid position data for {symbol} during exit check (Size: {position_amt}, EP: {entry_price_from_exchange}). Skipping.")
+                         # Maybe trigger sync or cleanup
+                         continue
+
+                    # Get local details
+                    with position_details_lock:
+                         if symbol not in position_details:
+                             logger.error(f"Position details missing locally for open position {symbol}! Triggering sync/recovery might be needed.")
+                             # Attempt a quick sync for this symbol? Risky in loop. Skip for now.
+                             continue
+                         pos_details = position_details[symbol].copy()
+
+                    # Verify/update entry price (use exchange as source of truth)
+                    local_entry_price = pos_details.get('entry_price')
+                    if local_entry_price is None or abs(local_entry_price - entry_price_from_exchange) / entry_price_from_exchange > 0.001:
+                         logger.warning(f"Updating local entry price for {symbol}: {local_entry_price} -> {entry_price_from_exchange}")
+                         pos_details['entry_price'] = entry_price_from_exchange
+                         with position_details_lock:
+                             if symbol in position_details: position_details[symbol]['entry_price'] = entry_price_from_exchange
+
+
+                    # Safely extract details needed for exit check
+                    entry_price = pos_details['entry_price']
+                    stop_loss = pos_details.get('stop_loss')
+                    target = pos_details.get('target')
+                    position_type = pos_details.get('position_type')
+                    trailing_activated = pos_details.get('trailing_activated', False)
+                    highest_reached = pos_details.get('highest_reached')
+                    lowest_reached = pos_details.get('lowest_reached')
+                    signal_type_reason = pos_details.get('signal_type', 'unknown') # Entry reason for stats
+
+                    if not all([entry_price, stop_loss, target, position_type]):
+                        logger.error(f"Incomplete position details for {symbol} exit check. Skipping.")
+                        continue
+
+                    # Get required market data from WS caches
+                    current_price = get_current_price(symbol)
+                    order_book = get_order_book(symbol) # Gets ccxt-like format {bids:[], asks:[], ...}
+                    open_interest = fetch_open_interest(exchange, symbol) # Get last polled/cached OI
+
+                    if current_price is None or order_book is None:
+                        logger.warning(f"Missing price or order book data from WS for {symbol}. Cannot check exit.")
+                        continue
+                    # OI is allowed to be None if fetch failed, indicator should handle it
+
+                    # Get indicator instance
+                    indicator = get_indicator(symbol, exchange)
+                    if indicator is None: continue
+
+                    # --- Perform Exit Check ---
+                    exit_result = indicator.check_exit_conditions(
+                        current_price=current_price,
+                        entry_price=entry_price,
+                        stop_loss=stop_loss,
+                        target=target,
+                        position_type=position_type,
+                        trailing_activated=trailing_activated,
+                        highest_reached=highest_reached,
+                        lowest_reached=lowest_reached,
+                        order_book=order_book, # Pass ccxt-like OB format
+                        open_interest=open_interest # Pass potentially None OI
+                    )
+
+                    # Update local state based on result (trailing SL, etc.)
+                    new_stop_loss_from_trail = exit_result.get('new_stop_loss', stop_loss)
+                    stop_loss_updated = False
+                    with position_details_lock:
+                        if symbol in position_details: # Still exists?
+                            position_details[symbol]['highest_reached'] = exit_result.get('highest_reached')
+                            position_details[symbol]['lowest_reached'] = exit_result.get('lowest_reached')
+                            position_details[symbol]['trailing_activated'] = exit_result.get('trailing_activated', trailing_activated)
+                            if new_stop_loss_from_trail != stop_loss:
+                                position_details[symbol]['stop_loss'] = new_stop_loss_from_trail
+                                logger.info(f"Trailing Stop Updated: {symbol} {position_type} -> {new_stop_loss_from_trail:.{indicator.indicator.price_decimals(current_price)}f}")
+                                stop_loss = new_stop_loss_from_trail # Update for current loop logic
+                                stop_loss_updated = True
+                                # **** IMPORTANT: If SL is trailed, we need to CANCEL existing SL/TP orders and place NEW ones ****
+                                # This part was missing in the original logic too.
+                                # Adding basic cancellation/replacement here.
+                                old_sl_id = pos_details.get('sl_order_id')
+                                old_tp_id = pos_details.get('tp_order_id')
+                                logger.info(f"Trailing stop moved for {symbol}. Attempting to replace SL/TP orders.")
+                                # Cancel existing orders first (best effort)
+                                try:
+                                     if old_sl_id: exchange.cancel_order(old_sl_id, symbol)
+                                     if old_tp_id: exchange.cancel_order(old_tp_id, symbol)
+                                     logger.info(f"Cancelled previous SL/TP orders ({old_sl_id}, {old_tp_id}) for {symbol}")
+                                except Exception as cancel_e:
+                                     logger.error(f"Failed to cancel old SL/TP for {symbol} during trailing update: {cancel_e}")
+                                # Place new SL/TP orders with the updated stop loss
+                                time.sleep(1.0) # Wait after cancel
+                                # Quantity needs to be the current position amount
+                                current_quantity = abs(position_amt)
+                                place_sl_tp_orders(exchange, symbol, position_type, current_quantity, new_stop_loss_from_trail, target)
+
+
+                    # --- Check Exit Trigger ---
+                    if exit_result.get('exit_triggered', False):
+                        quantity_to_exit = abs(position_amt)
+                        exit_side = 'sell' if position_type == 'long' else 'buy'
+                        exit_reason = exit_result.get('exit_reason', 'Unknown')
+                        profit_pct = exit_result.get('profit_pct', 0)
+
+                        logger.info(f"EXIT TRIGGERED: {symbol} {position_type} | Reason: {exit_reason} | PnL: {profit_pct:.2f}%")
+
+                        # ** Cancel existing SL/TP orders BEFORE placing market exit order **
+                        sl_order_id = pos_details.get('sl_order_id')
+                        tp_order_id = pos_details.get('tp_order_id')
+                        cancelled_bracket = True # Assume success unless error
+                        try:
+                             logger.info(f"Cancelling bracket orders ({sl_order_id}, {tp_order_id}) before market exit for {symbol}.")
+                             if sl_order_id: exchange.cancel_order(sl_order_id, symbol)
+                             if tp_order_id: exchange.cancel_order(tp_order_id, symbol)
+                             logger.info(f"Successfully cancelled bracket orders for {symbol}.")
+                             # Clear IDs from local state immediately after cancellation attempt
+                             with position_details_lock:
+                                  if symbol in position_details:
+                                       position_details[symbol]['sl_order_id'] = None
+                                       position_details[symbol]['tp_order_id'] = None
+                        except Exception as cancel_e:
+                             logger.error(f"Failed to cancel bracket orders for {symbol} before exit: {cancel_e}. Proceeding with exit anyway.")
+                             cancelled_bracket = False # Log failure
+
+
+                        # Place the market exit order
+                        exit_order_info = place_order(
+                            exchange, symbol, exit_side, quantity_to_exit, current_price,
+                            exit_order=True, # Sets reduceOnly
+                            place_target_order=False # Do not place SL/TP on an exit order
+                        )
+
+                        if exit_order_info:
+                            logger.info(f"Exit order placed successfully for {symbol}.")
+                            # Log trade closure details
+                            exit_price = exit_order_info.get('average', current_price) # Use actual fill price if possible
+                            # Recalculate final PnL based on actual exit price
+                            if entry_price != 0:
+                                 pnl_mult = 1 if position_type == 'long' else -1
+                                 final_profit_pct = ((exit_price - entry_price) / entry_price) * pnl_mult * 100
+                            else: final_profit_pct = 0
+
+                            exit_log = pos_details.copy()
+                            exit_log.update({
+                                'exit_price': exit_price,
+                                'exit_reason': exit_reason,
+                                'profit_pct': final_profit_pct,
+                                'position_status': 'Closed',
+                                'exit_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                                'stop_loss': stop_loss # Log the final SL level (potentially trailed)
+                            })
+                            # Clean up fields irrelevant for closed trade log
+                            keys_to_remove = ['highest_reached', 'lowest_reached', 'trailing_activated', 'entry_time', 'probability', 'sl_order_id', 'tp_order_id'] # Keep entry details, reasons etc.
+                            for key in keys_to_remove: exit_log.pop(key, None)
+
+                            log_trade(symbol, exit_log) # Queue the log
+
+                            # Update pattern stats
+                            if signal_type_reason != 'unknown' and indicator:
+                                try:
+                                    indicator.update_pattern_trade_result(signal_type_reason, final_profit_pct, win=(final_profit_pct > 0))
+                                except Exception as stat_e: logger.error(f"Error updating pattern stats for {symbol} on exit: {stat_e}")
+
+                            # Clean up local state *after* logging
+                            with position_details_lock:
+                                if symbol in position_details: del position_details[symbol]
+                            with cooldown_lock: # Also clear entry time if present
+                                 if symbol in position_entry_times: del position_entry_times[symbol]
+                            symbols_to_remove_from_processing.add(symbol) # Avoid re-entry in this cycle
+
+                        else: # Exit order failed
+                             logger.error(f"Failed to place exit order for {symbol}. Position remains open.")
+                             # Did we fail to cancel brackets? If so, they might still trigger.
+                             if not cancelled_bracket:
+                                 logger.warning(f" SL/TP orders ({sl_order_id}, {tp_order_id}) might still be active for {symbol} after failed market exit!")
+                             # Consider retry logic or alert
+
+                    # else: logger.debug(f"No exit condition met for {symbol}")
+
+
+                except ccxt.NetworkError as ne: logger.warning(f"Network error on exit for {symbol}: {ne}. Retrying next cycle.")
+                except ccxt.ExchangeError as ee: logger.error(f"Exchange error on exit for {symbol}: {ee}. Skipping.")
+                except Exception as e: logger.exception(f"Unexpected error processing exit for {symbol}: {e}")
+
+
+            # --- Process symbols for potential new entries ---
+            # Re-fetch open positions count after exits
+            active_open_positions_count = len(fetch_open_positions(exchange))
+            if active_open_positions_count >= MAX_OPEN_TRADES:
+                # logger.debug("Max open trades reached. Skipping new entries.")
+                pass # Skip entry loop
+            else:
+                # Iterate through symbols that have WS data
+                symbols_to_scan = list(monitored_symbols) # Use a copy
+                for symbol in symbols_to_scan:
+                    # Check eligibility for entry
+                    if symbol in open_positions or \
+                       symbol in symbols_to_remove_from_processing or \
+                       is_in_cooldown(symbol):
+                        continue
+
+                    if not check_ws_data_freshness(symbol): continue # Skip stale data
+
+                    try:
+                        # Market suitability check (using WS data)
+                        if not is_market_suitable(symbol):
+                            # logger.debug(f"Market {symbol} unsuitable for entry.")
+                            continue
+
+                        # Get data for indicator
+                        df = get_kline_df(symbol) # Gets DataFrame (incl. potentially partial last candle)
+                        order_book = get_order_book(symbol) # Gets ccxt-like format
+                        open_interest = fetch_open_interest(exchange, symbol) # Last fetched/cached OI
+                        current_price = get_current_price(symbol) # Latest price
+
+                        if df.empty or len(df) < 20 or order_book is None or current_price is None:
+                             logger.warning(f"Insufficient data for entry signal check: {symbol} (Candles:{len(df)}, OB:{order_book is not None}, Price:{current_price is not None})")
+                             continue
+
+                        # Get indicator
+                        indicator = get_indicator(symbol, exchange)
+                        if indicator is None: continue
+
+                        # --- Generate Signals ---
+                        # The indicator needs to accept DataFrame/Series/Dicts now
+                        # Ensure the indicator's compute_signals method is adapted
+                        # to potentially handle a non-closed last candle if needed.
+                        buy_signals, sell_signals, _, signal_info = indicator.compute_signals(
+                            df['open'], df['high'], df['low'], df['close'], # Pass series
+                            order_book=order_book,       # Pass OB dict
+                            open_interest=open_interest  # Pass OI value
+                        )
+                        # Note: compute_signals might need access to the full DF including the last candle
+                        # for calculating things like current ATR based on the incomplete candle's range.
+
+                        if signal_info is None or signal_info.empty:
+                             # logger.debug(f"No signal info generated for {symbol}")
+                             continue
+
+                        # Check signal on the latest candle data point available
+                        # signal_info index should align with df index
+                        latest_idx = signal_info.index[-1]
+
+                        # --- Process Signal ---
+                        signal_found = None
+                        if buy_signals.loc[latest_idx]: signal_found = 'buy'
+                        elif sell_signals.loc[latest_idx]: signal_found = 'sell'
+
+                        if signal_found:
+                            side = signal_found
+                            position_type = 'long' if side == 'buy' else 'short'
+
+                            # Extract details from signal_info
+                            reason = signal_info['reason'].loc[latest_idx]
+                            strength = signal_info['strength'].loc[latest_idx]
+                            probability = signal_info['probability'].loc[latest_idx]
+                            stop_loss = signal_info['stop_loss'].loc[latest_idx]
+                            target = signal_info['target'].loc[latest_idx]
+                            sl_basis = signal_info['sl_basis'].loc[latest_idx]
+                            tp_basis = signal_info['tp_basis'].loc[latest_idx]
+                            risk_reward = signal_info['risk_reward'].loc[latest_idx]
+
+                            log_trade_metrics('patterns_detected')
+
+                            # Validation (Signal Strength, SL/TP validity, R/R)
+                            signal_threshold = 30
+                            required_rr = 1.2
+                            if strength < signal_threshold: log_trade_metrics('patterns_below_threshold'); continue
+                            if pd.isna(stop_loss) or pd.isna(target) or stop_loss == 0 or target == 0 or risk_reward < required_rr: log_trade_metrics('failed_risk_reward'); logger.warning(f"Skipping {symbol} {side.upper()}: Invalid SL/TP/RR. SL={stop_loss}, TP={target}, RR={risk_reward:.2f}"); continue
+                            # Check SL/TP relative to current price
+                            if side == 'buy' and (stop_loss >= current_price or target <= current_price): log_trade_metrics('failed_risk_reward'); logger.warning(f"Skipping {symbol} BUY: SL {stop_loss} or TP {target} invalid relative to Price {current_price}"); continue
+                            if side == 'sell' and (stop_loss <= current_price or target >= current_price): log_trade_metrics('failed_risk_reward'); logger.warning(f"Skipping {symbol} SELL: SL {stop_loss} or TP {target} invalid relative to Price {current_price}"); continue
+
+                            # Prepare for order placement
+                            leverage = get_leverage_for_market(exchange, symbol)
+                            if not leverage: continue
+                            quantity = get_order_quantity(exchange, symbol, current_price, leverage)
+                            if quantity <= 0: logger.error(f"Calculated quantity is zero or negative for {symbol}. Skipping."); continue
+
+                            # Store details *before* placing order
+                            entry_time_ts = time.time()
+                            with position_details_lock:
+                                position_details[symbol] = {
+                                    'entry_price': current_price, # Tentative entry price
+                                    'stop_loss': stop_loss, 'target': target, 'position_type': position_type,
+                                    'entry_reason': reason, 'probability': probability, 'entry_time': entry_time_ts,
+                                    'highest_reached': current_price if position_type == 'long' else None,
+                                    'lowest_reached': current_price if position_type == 'short' else None,
+                                    'signal_type': reason, 'signal_strength': strength, 'risk_reward': risk_reward,
+                                    'sl_basis': sl_basis, 'tp_basis': tp_basis, 'leverage': leverage,
+                                    'sl_order_id': None, 'tp_order_id': None # Initialize SL/TP order IDs
+                                }
+
+                            logger.info(f"Attempting {side.upper()} ENTRY: {symbol} | Reason: {reason} | Strength: {strength:.1f}% | RR: {risk_reward:.2f}")
+
+                            # Place ENTRY order (Market) + SL/TP (Stop Market/Take Profit Market)
+                            order_info = place_order(
+                                exchange, symbol, side, quantity, current_price,
+                                leverage=leverage, exit_order=False,
+                                stop_loss=stop_loss, target_price=target, place_target_order=True # place_order now handles SL/TP placement
+                            )
+
+                            if order_info:
+                                log_trade_metrics('successful_entries')
+                                executed_price = order_info.get('average', current_price) # Use actual fill price
+
+                                # Update local state with actual entry price if significantly different
+                                if abs(executed_price - current_price) / current_price > 0.0005: # 0.05% diff
+                                    logger.info(f"Updating entry price for {symbol} to executed avg: {executed_price}")
+                                    with position_details_lock:
+                                        if symbol in position_details: position_details[symbol]['entry_price'] = executed_price
+                                else:
+                                    executed_price = current_price # Assume intended price if very close
+
+                                # Log the successful entry
+                                price_decimals = indicator.indicator.price_decimals(executed_price) if indicator and hasattr(indicator, 'indicator') else 6 # Get decimals for formatting
+                                logger.info(f"Opened {side.upper()} position for {symbol}. "
+                                            f"ExecPx: {executed_price:.{price_decimals}f} | "
+                                            f"Strength: {strength:.1f}% | R/R: {risk_reward:.2f} | "
+                                            f"SL: {stop_loss:.{price_decimals}f} ({sl_basis}) | "
+                                            f"TP: {target:.{price_decimals}f} ({tp_basis})")
+
+                                entry_log = {
+                                    'symbol': symbol, 'timestamp': time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry_time_ts)),
+                                    'position_status': 'Open', 'position_type': position_type, 'entry_price': executed_price,
+                                    'exit_price': None, 'stop_loss': stop_loss, 'target': target,
+                                    'entry_reason': reason, 'exit_reason': None, 'profit_pct': None,
+                                    'leverage': leverage, 'signal_strength': strength, 'risk_reward': risk_reward,
+                                    'signal_type': reason, 'sl_basis': sl_basis, 'tp_basis': tp_basis, 'probability': probability
+                                }
+                                log_trade(symbol, entry_log) # Queue the log
+
+                                time.sleep(SLEEP_INTERVAL / 2) # Small pause
+                                # Break if only one entry per cycle is desired
+                                # break # Uncomment to allow only one new entry per loop cycle
+                                # Check if max trades reached after this entry
+                                if len(fetch_open_positions(exchange)) >= MAX_OPEN_TRADES:
+                                    logger.info("Max open trades reached after entry. Stopping entry scan for this cycle.")
+                                    break # Stop scanning for new entries in this cycle
+
+                            else: # Order placement failed (place_order handles logging error)
+                                log_trade_metrics('order_placement_errors')
+                                # Clean up local state added before attempting order
+                                with position_details_lock:
+                                    if symbol in position_details and position_details[symbol]['entry_time'] == entry_time_ts:
+                                        del position_details[symbol]
+                                # No cooldown needed as no position was opened/closed
+
+                        # else: logger.debug(f"No entry signal for {symbol} on latest data.")
+
+
+                    except ccxt.NetworkError as ne: logger.warning(f"Network error processing entry for {symbol}: {ne}")
+                    except ccxt.ExchangeError as ee: logger.error(f"Exchange error processing entry for {symbol}: {ee}")
+                    except Exception as e: logger.exception(f"Unexpected error processing entry check for {symbol}: {e}")
+
+
+            # --- Main Loop Sleep ---
+            # logger.debug(f"Main loop cycle finished. Sleeping for {SLEEP_INTERVAL} seconds.")
+            time.sleep(SLEEP_INTERVAL)
+
+        except ccxt.RateLimitExceeded as e: logger.warning(f"Rate limit exceeded in main loop: {e}. Sleeping longer."); time.sleep(60)
+        except ccxt.NetworkError as e: logger.warning(f"Network error in main loop: {e}. Retrying soon."); time.sleep(20)
+        except ccxt.ExchangeError as e: logger.error(f"Exchange error in main loop: {e}. Sleeping."); time.sleep(SLEEP_INTERVAL * 2)
+        except KeyboardInterrupt:
+             logger.info("KeyboardInterrupt received. Stopping file writer and exiting.")
+             file_writer_stop_event.set()
+             break # Exit the while loop
+        except Exception as e:
+            logger.exception(f"CRITICAL error in main trading loop: {e}")
+            time.sleep(SLEEP_INTERVAL * 5) # Longer sleep on critical errors
+
+
+# --- Initialization and Startup ---
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    """ Main function to initialize and start the bot. """
+    logger.info("Starting trading bot...")
+     # --- ADD THIS SNIPPET ---
+    # Set asyncio event loop policy for Windows compatibility with aiodns/aiohttp
+    if sys.platform == "win32":
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            logger.info("Set asyncio event loop policy to WindowsSelectorEventLoopPolicy for compatibility.")
+        except Exception as e:
+             logger.error(f"Failed to set asyncio event loop policy: {e}. WebSocket stability might be affected.")
+    # --- END SNIPPET ---
+
+    # Create CCXT exchange instance (for REST API calls)
+    exchange = create_exchange()
     try:
-        exchange = ccxt.binanceusdm({
-            'apiKey': os.getenv('BINANCE_API_KEY'),
-            'secret': os.getenv('BINANCE_SECRET_KEY'),
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future'}
-        })
+        exchange.load_markets()
+        logger.info("Markets loaded via CCXT.")
     except Exception as e:
-        logging.exception(f"Failed to initialize exchange: {e}")
+        logger.critical(f"Failed to load markets: {e}. Exiting.")
         return
 
-    global historical_training_completed
-    historical_training_completed = False
+    # Start File Writer Thread
+    file_writer_thread = threading.Thread(target=file_writer_worker, daemon=True)
+    file_writer_thread.start()
+    logger.info("Started file writer thread.")
 
-    data_thread = threading.Thread(target=fetch_and_store_historic_data_threaded, daemon=True)
-    data_thread.start()
-    logging.info("Started historical data download thread.")
+    # Initial position synchronization
+    sync_positions_with_exchange(exchange)
 
-    # Start both training worker threads
-    historical_training_thread = threading.Thread(target=historical_training_worker, daemon=True)
-    historical_training_thread.start()
-    logging.info("Historical training worker thread started.")
+    # Determine initial symbols to monitor
+    # Fetch active symbols OR use a predefined list
+    initial_symbols = fetch_active_symbols(exchange, num_symbols=25) # Monitor top 25 initially
+    if not initial_symbols:
+         logger.critical("No active symbols found to monitor. Exiting.")
+         file_writer_stop_event.set() # Signal writer thread to stop
+         file_writer_thread.join(timeout=5) # Wait briefly for writer
+         return
+    logger.info(f"Monitoring initial symbols: {initial_symbols}")
 
-    retraining_thread = threading.Thread(target=retraining_worker, daemon=True)
-    retraining_thread.start()
-    logging.info("Retraining worker thread started.")
 
-    live_thread = threading.Thread(target=continuous_loop, args=(exchange,), daemon=True)
-    live_thread.start()
-    logging.info("Live trading loop started in main thread.")
+    # Initialize WebSocket Manager
+    twm = ThreadedWebsocketManager(
+        api_key=os.getenv('BINANCE_API_KEY'),
+        api_secret=os.getenv('BINANCE_SECRET_KEY'),
+        # Use testnet URL if needed: tld='com' for mainnet, check docs for testnet
+        # tld='com' # or 'us' etc. based on exchange
+    )
+    twm.start() # Start the manager thread
 
-    while True:
-        time.sleep(SLEEP_INTERVAL)
-        gc.collect()
+    # --- Start WebSocket Streams for Initial Symbols ---
+    active_streams = set() # Keep track of running streams
 
-if __name__ == '__main__':
+    # Convert ccxt symbols (e.g., 'ADA/USDT:USDT') to websocket format (e.g., 'ADAUSDT')
+    def symbol_to_ws(ccxt_symbol):
+        # Basic conversion, might need adjustment based on exact naming conventions
+        return ccxt_symbol.split(':')[0].replace('/', '')
+
+    for symbol_ccxt in initial_symbols:
+        symbol_ws = symbol_to_ws(symbol_ccxt)
+        logger.info(f"Starting WebSocket streams for {symbol_ccxt} (WS: {symbol_ws})")
+
+        try:
+            # 1. Fetch Initial Klines (REST) & Initialize Deque
+            initial_klines_list = fetch_initial_klines(exchange, symbol_ccxt, timeframe=TIMEFRAME, limit=LIMIT)
+            if initial_klines_list is not None: # Check for fetch error
+                with kline_lock:
+                    latest_kline_data[symbol_ccxt] = deque(initial_klines_list, maxlen=LIMIT + 10)
+                logger.info(f"Fetched initial {len(initial_klines_list)} klines for {symbol_ccxt}")
+            else:
+                logger.error(f"Could not fetch initial klines for {symbol_ccxt}. Indicator might not work.")
+                # Continue trying to start streams, but log the issue
+
+            # 2. Start Kline Stream (WS)
+            kline_stream_name = twm.start_kline_socket(callback=process_kline_message, symbol=symbol_ws, interval=TIMEFRAME)
+            active_streams.add(kline_stream_name)
+            logger.debug(f"Kline stream started: {kline_stream_name}")
+            time.sleep(0.2) # Small delay between starting streams
+
+            # 3. Fetch Initial Order Book Snapshot (REST) - CRITICAL: Do this *before* processing diffs
+            if not fetch_initial_order_book(exchange, symbol_ccxt):
+                 logger.error(f"Could not fetch initial order book for {symbol_ccxt}. Depth stream may be inaccurate initially.")
+            time.sleep(0.5) # Wait for snapshot fetch and potential initial processing
+
+            # 4. Start Depth Stream (WS) - Use DIFF stream
+            # Construct the specific stream name for the differential depth stream
+            depth_stream_name_path = f"{symbol_ws.lower()}@depth@{WEBSOCKET_UPDATE_SPEED}"
+            logger.info(f"Constructed depth stream path: {depth_stream_name_path}")
+
+            # Use start_multiplex_socket to start custom stream paths
+            # Pass the callback and a list containing the stream path(s)
+            # The return value is an identifier for the multiplex connection itself.
+            multiplex_stream_id = twm.start_multiplex_socket(callback=process_depth_message, streams=[depth_stream_name_path])
+
+            # Add the *path* to active_streams for tracking purposes,
+            # as the multiplex_stream_id refers to the connection, not the specific stream path within it.
+            active_streams.add(depth_stream_name_path)
+            logger.debug(f"Depth stream added via multiplex socket: Path={depth_stream_name_path}, ConnectionID={multiplex_stream_id}")
+            time.sleep(0.2)
+            # 5. Start Ticker Stream (WS)
+            ticker_stream_name = twm.start_symbol_ticker_socket(callback=process_ticker_message, symbol=symbol_ws)
+            active_streams.add(ticker_stream_name)
+            logger.debug(f"Ticker stream started: {ticker_stream_name}")
+            time.sleep(0.2)
+
+            # 6. Initialize Indicator (after initial data is potentially available)
+            _ = get_indicator(symbol_ccxt, exchange)
+
+            # 7. Initial OI Fetch (optional, loop handles periodic)
+            _ = fetch_open_interest(exchange, symbol_ccxt)
+
+            # Mark symbol as monitored (using ccxt symbol as the key)
+            with ws_update_time_lock: last_ws_update_time[symbol_ccxt] = time.time() # Mark as initially updated
+            monitored_symbols.add(symbol_ccxt) # Add to the set used by main loop
+
+
+        except Exception as e:
+            logger.error(f"Failed to start streams or fetch initial data for {symbol_ccxt}: {e}", exc_info=True)
+            # Clean up any partial data for this symbol?
+            with kline_lock: latest_kline_data.pop(symbol_ccxt, None)
+            with depth_lock: latest_depth_data.pop(symbol_ccxt, None)
+            with ticker_lock: latest_ticker_data.pop(symbol_ccxt, None)
+            with ws_update_time_lock: last_ws_update_time.pop(symbol_ccxt, None)
+            monitored_symbols.discard(symbol_ccxt)
+
+
+    logger.info(f"WebSocket streams started for {len(monitored_symbols)} symbols.")
+
+    # Start the main trading loop thread
+    trading_thread = threading.Thread(target=continuous_loop, args=(exchange,), daemon=True)
+    trading_thread.start()
+    logger.info("Started main trading loop thread.")
+
+    # Keep main thread alive to manage WebSocket connection and allow graceful shutdown
+    try:
+        while trading_thread.is_alive():
+             trading_thread.join(timeout=1.0) # Wait for trading thread
+    except KeyboardInterrupt:
+        logger.info("Shutdown signal received in main thread.")
+    finally:
+        logger.info("Stopping WebSocket manager...")
+        twm.stop() # Stop WebSocket manager gracefully
+        logger.info("Signaling file writer thread to stop...")
+        file_writer_stop_event.set()
+        file_writer_thread.join(timeout=5) # Wait for writer thread
+        logger.info("Trading bot shutdown complete.")
+
+
+if __name__ == "__main__":
+    # Load environment variables (e.g., from .env file if using python-dotenv)
+    # from dotenv import load_dotenv
+    # load_dotenv()
     main()
+
+# --- END OF main_websocket.py ---
