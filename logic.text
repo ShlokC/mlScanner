@@ -1,0 +1,132 @@
+# Cryptocurrency Trading System Design Documentation
+
+## System Overview
+The system is a cryptocurrency trading bot that focuses on momentum-based short selling opportunities, with automatic position reversals from short to long when stop losses are hit. The system monitors price movements on Binance Futures to identify coins that have experienced significant gains (20%+ over 1-3 days) and are showing signs of reversal.
+
+The system consists of two main components:
+1. `MomentumShortIndicator.py` - Handles signal generation and technical analysis
+2. `main.py` - Manages trading execution, position management, and exchange interactions
+
+## MomentumShortIndicator.py
+
+### Core Logic
+The MomentumShortIndicator identifies potential shorting opportunities using three primary criteria:
+1. The coin has gained at least 20% in price over the past 1-3 days
+2. After the gain, price has crossed below the Hull Moving Average (HMA)
+3. The Supertrend indicator is bearish (red)
+
+### Key Components
+
+#### Initialization
+- The indicator takes parameters like `lookback_days` (default 3), `min_price_gain` (default 20%), `hma_period` (default 144 for 5-min candles), `supertrend_factor` and `sl_buffer_pct` (buffer for stop losses above HMA)
+- Maintains internal state tracking for price history and detected crossunders
+
+#### Price Gain Detection
+- `check_price_gain()` analyzes recent price data to find any instances where a coin has gained >= 20% from any low to any high within the lookback period
+- Uses vectorized operations for performance
+- Returns the gain percentage, low/high prices, and timestamps of the gain
+
+#### HMA Crossunder Detection
+- `check_hma_crossunder()` identifies when price crosses below the HMA
+- Specifically looks for the FIRST meaningful crossunder after a significant price high
+- Evaluates if price was consistently above HMA for several candles before crossing under
+- Returns whether a valid crossunder was found, how old it is, and if it's the first one after the high
+
+#### Signal Generation
+- `generate_signal()` combines the above analyses to determine if all criteria are met for a short entry
+- Ensures sufficient data for calculation (2*HMA period + sqrt(HMA period) candles at minimum)
+- Maintains state to avoid signaling multiple times on the same crossunder
+- Generates a complete signal with entry price, stop loss level, and detailed condition information
+- The stop loss is set at HMA + buffer percentage
+
+## main.py
+
+### Core Trading Logic
+
+#### Momentum Short Trading Loop
+- The `momentum_short_trading_loop()` function runs continuously in a separate thread
+- It has two main phases:
+  1. Position management (monitoring and exiting existing positions)
+  2. New entry detection (finding new opportunities when below max open trades)
+
+#### Position Management
+- Periodically updates stop losses for existing positions based on the current HMA values
+- For each open position, calculates:
+  - Current HMA value
+  - Dynamic stop loss (above HMA for shorts, below HMA for longs)
+  - Price in relation to entry price and stop loss
+- CRITICAL: Trigger exit (with possible reversal) when:
+  - For shorts: price rises above stop loss OR above entry price
+  - For longs: price falls below stop loss
+- When a SHORT position hits its stop loss:
+  1. Exit the short position completely
+  2. THEN automatically reverse to a LONG position with equivalent size
+  3. Set the new stop loss based on HMA for the long
+- When a LONG position hits its stop loss:
+  1. Exit the long position
+  2. DO NOT reverse to short (asymmetrical behavior by design)
+
+#### Entry Detection
+1. Find coins with recent 20%+ gains via `find_momentum_short_candidates()`
+2. For each candidate, check for valid entry signals:
+   - Must be the first HMA crossunder after a significant gain
+   - Must have bearish Supertrend confirmation
+3. For valid signals, calculate position size based on risk parameters
+4. Place market order for entry
+5. Set stop loss order based on HMA + buffer
+
+### Critical Support Functions
+
+#### Position Order Handling
+- `place_order()`: Places market orders with proper error handling
+  - FIXED ISSUE: Handles "ReduceOnly Order is rejected" errors by retrying without reduceOnly flag
+  - Records entry times for minimum hold time tracking
+
+#### Stop Loss Management
+- `update_momentum_stop_losses()`: Dynamically adjusts stop losses based on HMA movements
+- `place_sl_tp_orders()`: Places stop loss and take profit orders with validation
+
+#### Data Fetching
+- `fetch_binance_data()`: Gets OHLCV data with proper caching and error handling
+- Ensures sufficient data quality for indicator calculations
+
+#### Position Validation
+- `sync_positions_with_exchange()`: Ensures local state matches exchange state
+- Recovers from situations where the system might have missed position changes
+
+## Key Requirements and Behaviors
+
+1. Only enter short positions on the FIRST HMA crossunder after a 20%+ gain
+2. Short position exit should occur when:
+   - Price rises above HMA-based stop loss OR
+   - Price rises above entry price
+3. For short positions that hit stop loss, automatically reverse to long
+4. For long positions that hit stop loss, exit without reversing
+5. Maintain minimum hold time (default 2 minutes) before allowing exit
+6. No cooldown periods after position exits
+7. Maximum of 3 open positions at any time (MAX_OPEN_TRADES = 3)
+
+## Configuration Parameters
+- SLEEP_INTERVAL: Time between main loop iterations (2 seconds)
+- MOMENTUM_TIMEFRAME: Timeframe for momentum analysis (5 minutes)
+- MINIMUM_HOLD_MINUTES: Minimum position hold time (2 minutes)
+- LEVERAGE_OPTIONS: Leverage levels to try (30, 25, 15, 8)
+- AMOUNT_USD: Position size in USD (1 USD)
+- MOMENTUM_PARAMS: Parameters for momentum short strategy detection
+
+## Error Handling
+The system has multiple layers of error handling:
+- Network error resilience
+- Position state validation before orders
+- Order execution error handling
+- Fallback options when primary methods fail
+
+## Implementation Challenges
+The main challenges in this system are:
+1. Correctly identifying the first HMA crossunder after a significant gain
+2. Maintaining accurate position tracking between local state and exchange state
+3. Properly handling exits and reversals when stop losses are hit
+4. Ensuring sufficient data quality for reliable signal generation
+5. Handling edge cases like reduced-only order rejections
+
+This system requires careful state management and proper exchange integration to ensure reliable trading operations.
