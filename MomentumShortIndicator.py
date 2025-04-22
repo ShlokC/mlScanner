@@ -32,7 +32,7 @@ class MomentumShortIndicator:
     def __init__(self, 
                 symbol="UNKNOWN",
                 lookback_days=1,
-                min_price_change=30.0,  # 20% minimum gain/decrease
+                min_price_change=20.0,  # 20% minimum gain/decrease
                 ema_period=144,       # ema period for 5-min candles (144 = 12 hours)
                 supertrend_factor=1.0, # Supertrend multiplier
                 supertrend_length=7,  # Supertrend period
@@ -171,7 +171,7 @@ class MomentumShortIndicator:
                         if max_gain_pct >= self.min_price_change * 1.5:
                             break
 
-            # Check if gain exceeds minimum threshold (now 30%)
+            # Check if gain exceeds minimum threshold (now 20%)
             has_gained = max_gain_pct >= self.min_price_change
 
             return has_gained, max_gain_pct, best_low_price, best_high_price, best_low_idx, best_high_idx
@@ -259,7 +259,7 @@ class MomentumShortIndicator:
                         if max_decrease_pct >= self.min_price_change * 1.5:
                             break
 
-            # Check if decrease exceeds minimum threshold (now 30%)
+            # Check if decrease exceeds minimum threshold (now 20%)
             has_decreased = max_decrease_pct >= self.min_price_change
 
             return has_decreased, max_decrease_pct, best_high_price, best_low_price, best_high_idx, best_low_idx
@@ -636,16 +636,18 @@ class MomentumShortIndicator:
         # Direction 1 means bullish (green)
         return current_direction == 1
     
-    def determine_stop_loss(self, df, position_type='short'):
+    def determine_stop_loss(self, df, position_type='short', entry_price=None):
         """
-        Determine stop-loss level based on ema and position type.
-        For shorts, stop loss is set above current ema with buffer.
-        For longs, stop loss is set below current ema with buffer.
+        Determine stop-loss level based on position type.
+        For shorts, stop loss is set above entry price with buffer.
+        For longs, stop loss is set below entry price with buffer.
+        If entry_price is None, falls back to using EMA-based stop loss.
         
         Args:
             df: DataFrame with OHLC data
             position_type: 'short' or 'long'
-            
+            entry_price: The entry price of the position, if available
+                
         Returns:
             float: Stop-loss price level or None if cannot be determined
         """
@@ -654,6 +656,18 @@ class MomentumShortIndicator:
                 logger.debug(f"{self.symbol}: Insufficient data for stop loss calculation")
                 return None
             
+            # If entry_price is provided, use it to calculate stop loss
+            if entry_price is not None and entry_price > 0:
+                if position_type == 'short':
+                    # Set stop-loss sl_buffer_pct% above entry price for shorts
+                    stop_loss = entry_price * (1 + self.sl_buffer_pct / 100)
+                else:  # long
+                    # Set stop-loss sl_buffer_pct% below entry price for longs
+                    stop_loss = entry_price * (1 - self.sl_buffer_pct / 100)
+                
+                return stop_loss
+                
+            # Fallback to EMA-based stop loss if entry_price is not provided
             # Check if ema already exists in the dataframe
             ema_columns = [col for col in df.columns if col.startswith('ema_')]
             
@@ -682,7 +696,7 @@ class MomentumShortIndicator:
                 stop_loss = current_ema * (1 - self.sl_buffer_pct / 100)
             
             return stop_loss
-    
+        
         except Exception as e:
             logger.error(f"{self.symbol}: Error determining stop loss: {e}")
             return None
@@ -690,19 +704,14 @@ class MomentumShortIndicator:
     def generate_exit_signal(self, df, current_position, entry_price, stop_loss):
         """
         Generate exit signal based on position type and current market conditions.
-        For shorts: Requires BOTH conditions to be met:
-        1. Price is sustainably above entry price
-        2. Price is sustainably above ema+buffer
-        
-        For longs: Requires BOTH conditions to be met:
-        1. Price is sustainably below entry price
-        2. Price is sustainably below ema-buffer
+        For shorts: Exit when price is above a specific percentage from entry price
+        For longs: Exit when price is below a specific percentage from entry price
         
         Args:
             df: DataFrame with OHLC data
             current_position: String indicating position type ('long' or 'short')
             entry_price: Original entry price
-            stop_loss: Current stop loss level (ema+buffer for shorts, ema-buffer for longs)
+            stop_loss: Current stop loss level (used as fallback)
             
         Returns:
             dict: Exit signal information
@@ -720,9 +729,19 @@ class MomentumShortIndicator:
             # Get current price
             current_price = df['close'].iloc[-1]
             
-            # Calculate current ema for reference
-            ema_series = df.ta.ema(length=self.ema_period)
-            current_ema = ema_series.iloc[-1] if not ema_series.empty else None
+            # Get EMA from dataframe if available, else calculate
+            ema_columns = [col for col in df.columns if col.startswith('ema_')]
+            if ema_columns:
+                # Use existing EMA from dataframe
+                current_ema = df[ema_columns[0]].iloc[-1]
+            else:
+                # Calculate EMA if not in dataframe
+                ema_series = df.ta.ema(length=self.ema_period)
+                current_ema = ema_series.iloc[-1] if not ema_series.empty else None
+            
+            # Define exit percentage thresholds
+            short_exit_pct = 2.0  # Exit short if price is 2% above entry price
+            long_exit_pct = 2.0   # Exit long if price is 2% below entry price
             
             # Initialize result
             exit_signal = {
@@ -733,42 +752,64 @@ class MomentumShortIndicator:
                 'ema_value': current_ema
             }
             
-            # Check for exit conditions with sustained threshold checks
+            # Check for exit conditions based on price movement from entry
             if current_position == 'short':
-                # For shorts - check if price is sustainably above BOTH entry price AND ema+buffer
-                sustained_above_sl = self.check_sustained_above_level(df, stop_loss)
-                sustained_above_entry = self.check_sustained_above_level(df, entry_price)
-                
-                # BOTH conditions must be met for exit
-                if sustained_above_sl and sustained_above_entry:
-                    exit_signal['signal'] = 'exit_short'
-                    exit_signal['exit_triggered'] = True
-                    exit_signal['reason'] = f'Price {current_price} sustainably above BOTH stop level {stop_loss} (ema+buffer) AND entry price {entry_price}'
-                    exit_signal['execute_reversal'] = True  # Signal to execute reversal (short to long)
+                # Calculate percentage change from entry price
+                if entry_price <= 0:
+                    return exit_signal  # Invalid entry price
                     
-                    # Add ema info for reference
-                    if current_ema is not None:
-                        ema_buffer = self.sl_buffer_pct
-                        exit_signal['ema_value'] = current_ema
-                        exit_signal['ema_plus_buffer'] = current_ema * (1 + ema_buffer/100)
-            
+                price_change_pct = ((current_price - entry_price) / entry_price) * 100
+                exit_threshold = entry_price * (1 + short_exit_pct/100)
+                
+                # Exit if price has moved up by the threshold percentage
+                if price_change_pct >= short_exit_pct:
+                    # Check if this movement is sustained for multiple candles
+                    sustained_move = self.check_sustained_above_level(df, exit_threshold)
+                    
+                    if sustained_move:
+                        exit_signal['signal'] = 'exit_short'
+                        exit_signal['exit_triggered'] = True
+                        exit_signal['reason'] = f'Price {current_price} is {price_change_pct:.2f}% above entry price {entry_price} (threshold: {short_exit_pct}%)'
+                        exit_signal['execute_reversal'] = True  # Signal to execute reversal (short to long)
+                
+                # Fallback to stop loss check if no percentage-based exit
+                elif stop_loss is not None and current_price >= stop_loss:
+                    sustained_above_sl = self.check_sustained_above_level(df, stop_loss)
+                    
+                    if sustained_above_sl:
+                        exit_signal['signal'] = 'exit_short'
+                        exit_signal['exit_triggered'] = True
+                        exit_signal['reason'] = f'Price {current_price} sustainably above stop loss {stop_loss}'
+                        exit_signal['execute_reversal'] = False  # Don't reverse on stop loss hit
+                
             elif current_position == 'long':
-                # For longs - check if price is sustainably below BOTH entry price AND ema-buffer
-                sustained_below_sl = self.check_sustained_below_level(df, stop_loss)
-                sustained_below_entry = self.check_sustained_below_level(df, entry_price)
-                
-                # BOTH conditions must be met for exit
-                if sustained_below_sl and sustained_below_entry:
-                    exit_signal['signal'] = 'exit_long'
-                    exit_signal['exit_triggered'] = True
-                    exit_signal['reason'] = f'Price {current_price} sustainably below BOTH stop level {stop_loss} (ema-buffer) AND entry price {entry_price}'
-                    exit_signal['execute_reversal'] = True  # Signal to execute reversal (long to short)
+                # Calculate percentage change from entry price
+                if entry_price <= 0:
+                    return exit_signal  # Invalid entry price
                     
-                    # Add ema info for reference
-                    if current_ema is not None:
-                        ema_buffer = self.sl_buffer_pct
-                        exit_signal['ema_value'] = current_ema
-                        exit_signal['ema_minus_buffer'] = current_ema * (1 - ema_buffer/100)
+                price_change_pct = ((entry_price - current_price) / entry_price) * 100
+                exit_threshold = entry_price * (1 - long_exit_pct/100)
+                
+                # Exit if price has moved down by the threshold percentage
+                if price_change_pct >= long_exit_pct:
+                    # Check if this movement is sustained for multiple candles
+                    sustained_move = self.check_sustained_below_level(df, exit_threshold)
+                    
+                    if sustained_move:
+                        exit_signal['signal'] = 'exit_long'
+                        exit_signal['exit_triggered'] = True
+                        exit_signal['reason'] = f'Price {current_price} is {price_change_pct:.2f}% below entry price {entry_price} (threshold: {long_exit_pct}%)'
+                        exit_signal['execute_reversal'] = True  # Signal to execute reversal (long to short)
+                
+                # Fallback to stop loss check if no percentage-based exit
+                elif stop_loss is not None and current_price <= stop_loss:
+                    sustained_below_sl = self.check_sustained_below_level(df, stop_loss)
+                    
+                    if sustained_below_sl:
+                        exit_signal['signal'] = 'exit_long'
+                        exit_signal['exit_triggered'] = True
+                        exit_signal['reason'] = f'Price {current_price} sustainably below stop loss {stop_loss}'
+                        exit_signal['execute_reversal'] = False  # Don't reverse on stop loss hit
             
             return exit_signal
         
@@ -811,7 +852,11 @@ class MomentumShortIndicator:
             df = self.price_history.copy()
             
             # If we're in a position, check for exit signals
-            if current_position is not None and entry_price is not None and stop_loss is not None:
+            if current_position is not None and entry_price is not None:
+                # If a stop loss is provided, use it; otherwise recalculate based on entry price
+                if stop_loss is None:
+                    stop_loss = self.determine_stop_loss(df, position_type=current_position, entry_price=entry_price)
+                    
                 return self.generate_exit_signal(df, current_position, entry_price, stop_loss)
             
             # Initialize variables for entry signals
@@ -850,7 +895,7 @@ class MomentumShortIndicator:
             is_above_ema = current_price > current_ema if current_ema is not None else False
                     
             # First, check for short signal conditions
-            # 1. Check for price gain - 30% in 24 hours
+            # 1. Check for price gain - 20% in 24 hours
             has_price_gain, gain_pct, low_price, high_price, low_idx, high_idx = self.check_price_gain(df)
             
             # 2. Check for ema crossunder
@@ -860,7 +905,7 @@ class MomentumShortIndicator:
             is_supertrend_bearish = self.check_supertrend_bearish(df, supertrend_data)
             
             # *** Check for crossunder on current or previous 6 candles ***
-            is_recent_crossunder = crossunder_age <= 6  # 0-6 = current or up to 6 candles ago
+            is_recent_crossunder = crossunder_age <= 1000  # 0-6 = current or up to 6 candles ago
             
             # All conditions for a sell (short) signal
             short_conditions_met = {
@@ -878,7 +923,7 @@ class MomentumShortIndicator:
             }
             
             # Next, check for long signal conditions
-            # 1. Check for price decrease - 30% in 24 hours
+            # 1. Check for price decrease - 20% in 24 hours
             has_price_decrease, decrease_pct, decrease_high_price, decrease_low_price, decrease_high_idx, decrease_low_idx = self.check_price_decrease(df)
             
             # 2. Check for ema crossover
@@ -918,8 +963,9 @@ class MomentumShortIndicator:
             if (has_price_gain and has_ema_crossunder and is_recent_crossunder 
                 and is_supertrend_bearish and is_below_ema):
                 
-                # Determine stop-loss based on ema for short position
-                stop_loss = self.determine_stop_loss(df, position_type='short')
+                # For new positions, use current price as the intended entry price
+                # When generating a signal, the position isn't open yet
+                stop_loss = self.determine_stop_loss(df, position_type='short', entry_price=current_price)
                 
                 if stop_loss is None or stop_loss <= 0:
                     return {
@@ -947,12 +993,14 @@ class MomentumShortIndicator:
                     'is_recent_crossunder': is_recent_crossunder,
                     'crossunder_age': crossunder_age,
                     'crossunder_minutes_ago': minutes_ago_crossunder,
-                    'exit_triggered': False
+                    'exit_triggered': False,
+                    'ema_value': current_ema
                 }
                 
                 # Log additional debug info for this valid signal
                 logger.info(f"VALID SHORT SIGNAL for {self.symbol}: Crossunder within last 6 candles, "
-                        f"on candle {crossunder_age}, {minutes_ago_crossunder} minutes ago, drawdown: {drawdown_pct:.2f}%")
+                        f"on candle {crossunder_age}, {minutes_ago_crossunder} minutes ago, drawdown: {drawdown_pct:.2f}%, "
+                        f"Entry: {current_price}, SL: {stop_loss} ({self.sl_buffer_pct}% above entry)")
                 
                 return signal
             
@@ -960,8 +1008,8 @@ class MomentumShortIndicator:
             elif (has_price_decrease and has_ema_crossover and is_recent_crossover 
                 and is_supertrend_bullish and is_above_ema):
                 
-                # Determine stop-loss based on ema for long position
-                stop_loss = self.determine_stop_loss(df, position_type='long')
+                # For new positions, use current price as the intended entry price
+                stop_loss = self.determine_stop_loss(df, position_type='long', entry_price=current_price)
                 
                 if stop_loss is None or stop_loss <= 0:
                     return {
@@ -989,12 +1037,14 @@ class MomentumShortIndicator:
                     'is_recent_crossover': is_recent_crossover,
                     'crossover_age': crossover_age,
                     'crossover_minutes_ago': minutes_ago_crossover,
-                    'exit_triggered': False
+                    'exit_triggered': False,
+                    'ema_value': current_ema
                 }
                 
                 # Log additional debug info for this valid signal
                 logger.info(f"VALID LONG SIGNAL for {self.symbol}: Crossover within last 6 candles, "
-                        f"on candle {crossover_age}, {minutes_ago_crossover} minutes ago, recovery: {recovery_pct:.2f}%")
+                        f"on candle {crossover_age}, {minutes_ago_crossover} minutes ago, recovery: {recovery_pct:.2f}%, "
+                        f"Entry: {current_price}, SL: {stop_loss} ({self.sl_buffer_pct}% below entry)")
                 
                 return signal
             
@@ -1013,7 +1063,8 @@ class MomentumShortIndicator:
                 'stop_loss': None,
                 'short_conditions_met': short_conditions_met,
                 'long_conditions_met': long_conditions_met,
-                'exit_triggered': False
+                'exit_triggered': False,
+                'ema_value': current_ema
             }
         
         except Exception as e:
