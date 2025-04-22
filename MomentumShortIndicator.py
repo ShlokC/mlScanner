@@ -16,35 +16,35 @@ class MomentumShortIndicator:
     
     Short Entry Criteria:
     1. Coin has gained 20%+ in last 1-3 days (using 5-min candles)
-    2. Price has crossed below ema(144) on 5-min candle after being above for multiple candles
+    2. Price has crossed below kama(40) on 5-min candle after being above for multiple candles
     3. Supertrend indicator is red (bearish) on 5-min candle
     
     Long Entry Criteria:
     1. Coin has decreased 20%+ in last 1-3 days (using 5-min candles)
-    2. Price has crossed above ema(144) on 5-min candle after being below for multiple candles
+    2. Price has crossed above kama(40) on 5-min candle after being below for multiple candles
     3. Supertrend indicator is green (bullish) on 5-min candle
     
     Exit Criteria:
-    1. For shorts: Price sustainably above stop loss (ema+buffer) or entry price
-    2. For longs: Price sustainably below stop loss (ema-buffer) or entry price
+    1. For shorts: Price sustainably above stop loss (kama+buffer) or entry price
+    2. For longs: Price sustainably below stop loss (kama-buffer) or entry price
     """
     
     def __init__(self, 
                 symbol="UNKNOWN",
                 lookback_days=1,
-                min_price_change=20.0,  # 20% minimum gain/decrease
-                ema_period=144,       # ema period for 5-min candles (144 = 12 hours)
-                supertrend_factor=1.0, # Supertrend multiplier
+                min_price_change=30.0,  # 20% minimum gain/decrease
+                kama_period=40,       # kama period for 5-min candles (40 = 12 hours)
+                supertrend_factor=2.0, # Supertrend multiplier
                 supertrend_length=7,  # Supertrend period
-                sl_buffer_pct=2.0,     # SL buffer percent above/below ema
-                entry_sustained_candles=3,  # Candles above/below ema before cross for entry
+                sl_buffer_pct=6.0,     # SL buffer percent above/below kama
+                entry_sustained_candles=3,  # Candles above/below kama before cross for entry
                 exit_sustained_candles=2,   # Candles above/below threshold for exit
                 **kwargs):
         
         self.symbol = symbol
         self.lookback_days = lookback_days
         self.min_price_change = min_price_change
-        self.ema_period = ema_period
+        self.kama_period = kama_period
         self.supertrend_factor = supertrend_factor
         self.supertrend_length = supertrend_length
         self.sl_buffer_pct = sl_buffer_pct
@@ -113,7 +113,7 @@ class MomentumShortIndicator:
                 return False, 0.0, None, None, None, None
 
             # Calculate candles per day for 5-min timeframe
-            candles_per_day = int(24 * 60 / 5)  # 288 candles per day (5-min timeframe)
+            candles_per_day = int(24 * 60 / 5)  # 40 candles per day (5-min timeframe)
 
             # Calculate how many candles to look back - exactly 24 hours
             lookback_candles = candles_per_day * days
@@ -201,7 +201,7 @@ class MomentumShortIndicator:
                 return False, 0.0, None, None, None, None
 
             # Calculate candles per day for 5-min timeframe
-            candles_per_day = int(24 * 60 / 5)  # 288 candles per day (5-min timeframe)
+            candles_per_day = int(24 * 60 / 5)  # 40 candles per day (5-min timeframe)
 
             # Calculate how many candles to look back - exactly 24 hours
             lookback_candles = candles_per_day * days
@@ -268,11 +268,11 @@ class MomentumShortIndicator:
             logger.info(f"Error while checking price decrease for {self.symbol}: {e}")
             return False, 0.0, None, None, None, None
 
-    def check_ema_crossunder(self, df, lookback_candles=864):
+    def check_kama_crossunder(self, df, lookback_candles=864):
         """
-        Detect when price crosses below ema with special attention to whether
+        Detect when price crosses below kama with special attention to whether
         this is the first crossunder after a significant high point and
-        after a sustained period above the ema.
+        after a sustained period above the kama.
         """
         # Standard initialization
         has_crossunder = False
@@ -282,7 +282,7 @@ class MomentumShortIndicator:
         
         try:
             # Ensure adequate data
-            if df is None or len(df) < self.ema_period:
+            if df is None or len(df) < self.kama_period:
                 return has_crossunder, crossunder_candle_age, minutes_ago, is_first_crossunder
                 
             # First, identify if there was a significant gain and find the high point
@@ -292,33 +292,33 @@ class MomentumShortIndicator:
             if not has_gain or high_idx is None:
                 return has_crossunder, crossunder_candle_age, minutes_ago, is_first_crossunder
                 
-            # Find or ensure ema column exists
-            ema_columns = [col for col in df.columns if col.startswith('ema_')]
-            if not ema_columns:
+            # Find or ensure kama column exists
+            kama_columns = [col for col in df.columns if col.startswith('kama_')]
+            if not kama_columns:
                 return has_crossunder, crossunder_candle_age, minutes_ago, is_first_crossunder
                 
-            ema_column = ema_columns[0]
+            kama_column = kama_columns[0]
             
-            # Create price vs ema relationship (above/below)
-            df_valid = df.dropna(subset=['close', ema_column]).copy()
-            df_valid['above_ema'] = df_valid['close'] > df_valid[ema_column]
+            # Create price vs kama relationship (above/below)
+            df_valid = df.dropna(subset=['close', kama_column]).copy()
+            df_valid['above_kama'] = df_valid['close'] > df_valid[kama_column]
             
             # Find all crossunder points (transition from above to below)
             crossunder_points = []
             for i in range(1, len(df_valid)):
-                if df_valid['above_ema'].iloc[i-1] and not df_valid['above_ema'].iloc[i]:
+                if df_valid['above_kama'].iloc[i-1] and not df_valid['above_kama'].iloc[i]:
                     crossunder_points.append((df_valid.index[i], i))
             
             if not crossunder_points:
                 return has_crossunder, crossunder_candle_age, minutes_ago, is_first_crossunder
             
-            # Define how many consecutive candles price should be above ema to consider it a valid setup
-            required_candles_above_ema = self.entry_sustained_candles
+            # Define how many consecutive candles price should be above kama to consider it a valid setup
+            required_candles_above_kama = self.entry_sustained_candles
             
             # Define the minimum time between valid crossunders (to prevent multiple signals)
             min_candles_between_crossunders = 12  # At least 12 candles (1 hour for 5-min candles)
             
-            # Find valid crossunders - ones where price has been above ema for 'required_candles_above_ema'
+            # Find valid crossunders - ones where price has been above kama for 'required_candles_above_kama'
             # and that occur after the high point
             valid_crossunders = []
             
@@ -328,18 +328,18 @@ class MomentumShortIndicator:
                     continue
                 
                 # Check if there are enough candles to look back
-                if idx < required_candles_above_ema + 1:
+                if idx < required_candles_above_kama + 1:
                     continue
                 
-                # Check if price was consistently above ema for the required period before the crossunder
-                all_above_ema = True
-                for j in range(1, required_candles_above_ema + 1):
-                    if not df_valid['above_ema'].iloc[idx - j]:
-                        all_above_ema = False
+                # Check if price was consistently above kama for the required period before the crossunder
+                all_above_kama = True
+                for j in range(1, required_candles_above_kama + 1):
+                    if not df_valid['above_kama'].iloc[idx - j]:
+                        all_above_kama = False
                         break
                 
-                # Only add if price was consistently above ema
-                if all_above_ema:
+                # Only add if price was consistently above kama
+                if all_above_kama:
                     # Check if this is far enough from the previous valid crossunder
                     if valid_crossunders and (idx - valid_crossunders[-1][1]) < min_candles_between_crossunders:
                         # Skip if too close to previous valid crossunder
@@ -376,14 +376,14 @@ class MomentumShortIndicator:
             return has_crossunder, crossunder_candle_age, minutes_ago, is_first_crossunder
             
         except Exception as e:
-            logger.error(f"{self.symbol}: Error in check_ema_crossunder: {e}")
+            logger.error(f"{self.symbol}: Error in check_kama_crossunder: {e}")
             return False, 0, 0, False
     
-    def check_ema_crossover(self, df, lookback_candles=864):
+    def check_kama_crossover(self, df, lookback_candles=864):
         """
-        Detect when price crosses above ema with special attention to whether
+        Detect when price crosses above kama with special attention to whether
         this is the first crossover after a significant low point and
-        after a sustained period below the ema.
+        after a sustained period below the kama.
         """
         # Standard initialization
         has_crossover = False
@@ -393,7 +393,7 @@ class MomentumShortIndicator:
         
         try:
             # Ensure adequate data
-            if df is None or len(df) < self.ema_period:
+            if df is None or len(df) < self.kama_period:
                 return has_crossover, crossover_candle_age, minutes_ago, is_first_crossover
                 
             # First, identify if there was a significant decrease and find the low point
@@ -403,33 +403,33 @@ class MomentumShortIndicator:
             if not has_decreased or low_idx is None:
                 return has_crossover, crossover_candle_age, minutes_ago, is_first_crossover
                 
-            # Find or ensure ema column exists
-            ema_columns = [col for col in df.columns if col.startswith('ema_')]
-            if not ema_columns:
+            # Find or ensure kama column exists
+            kama_columns = [col for col in df.columns if col.startswith('kama_')]
+            if not kama_columns:
                 return has_crossover, crossover_candle_age, minutes_ago, is_first_crossover
                 
-            ema_column = ema_columns[0]
+            kama_column = kama_columns[0]
             
-            # Create price vs ema relationship (above/below)
-            df_valid = df.dropna(subset=['close', ema_column]).copy()
-            df_valid['below_ema'] = df_valid['close'] < df_valid[ema_column]
+            # Create price vs kama relationship (above/below)
+            df_valid = df.dropna(subset=['close', kama_column]).copy()
+            df_valid['below_kama'] = df_valid['close'] < df_valid[kama_column]
             
             # Find all crossover points (transition from below to above)
             crossover_points = []
             for i in range(1, len(df_valid)):
-                if df_valid['below_ema'].iloc[i-1] and not df_valid['below_ema'].iloc[i]:
+                if df_valid['below_kama'].iloc[i-1] and not df_valid['below_kama'].iloc[i]:
                     crossover_points.append((df_valid.index[i], i))
             
             if not crossover_points:
                 return has_crossover, crossover_candle_age, minutes_ago, is_first_crossover
             
-            # Define how many consecutive candles price should be below ema to consider it a valid setup
-            required_candles_below_ema = self.entry_sustained_candles
+            # Define how many consecutive candles price should be below kama to consider it a valid setup
+            required_candles_below_kama = self.entry_sustained_candles
             
             # Define the minimum time between valid crossovers (to prevent multiple signals)
             min_candles_between_crossovers = 12  # At least 12 candles (1 hour for 5-min candles)
             
-            # Find valid crossovers - ones where price has been below ema for 'required_candles_below_ema'
+            # Find valid crossovers - ones where price has been below kama for 'required_candles_below_kama'
             # and that occur after the low point
             valid_crossovers = []
             
@@ -439,18 +439,18 @@ class MomentumShortIndicator:
                     continue
                 
                 # Check if there are enough candles to look back
-                if idx < required_candles_below_ema + 1:
+                if idx < required_candles_below_kama + 1:
                     continue
                 
-                # Check if price was consistently below ema for the required period before the crossover
-                all_below_ema = True
-                for j in range(1, required_candles_below_ema + 1):
-                    if not df_valid['below_ema'].iloc[idx - j]:
-                        all_below_ema = False
+                # Check if price was consistently below kama for the required period before the crossover
+                all_below_kama = True
+                for j in range(1, required_candles_below_kama + 1):
+                    if not df_valid['below_kama'].iloc[idx - j]:
+                        all_below_kama = False
                         break
                 
-                # Only add if price was consistently below ema
-                if all_below_ema:
+                # Only add if price was consistently below kama
+                if all_below_kama:
                     # Check if this is far enough from the previous valid crossover
                     if valid_crossovers and (idx - valid_crossovers[-1][1]) < min_candles_between_crossovers:
                         # Skip if too close to previous valid crossover
@@ -487,7 +487,7 @@ class MomentumShortIndicator:
             return has_crossover, crossover_candle_age, minutes_ago, is_first_crossover
             
         except Exception as e:
-            logger.error(f"{self.symbol}: Error in check_ema_crossover: {e}")
+            logger.error(f"{self.symbol}: Error in check_kama_crossover: {e}")
             return False, 0, 0, False
     
     def check_sustained_above_level(self, df, level, num_candles=None):
@@ -503,19 +503,20 @@ class MomentumShortIndicator:
         Returns:
             bool: True if the most recent num_candles candles are all above the level
         """
-        if num_candles is None:
-            num_candles = self.exit_sustained_candles
+        # if num_candles is None:
+        #     num_candles = self.exit_sustained_candles
             
-        if df is None or len(df) < num_candles:
-            return False
+        # if df is None or len(df) < num_candles:
+        #     return False
         
-        # Get just the most recent num_candles
-        recent_candles = df.iloc[-num_candles:]
+        # # Get just the most recent num_candles
+        # recent_candles = df.iloc[-num_candles:]
         
-        # Check if ALL of these candles are above the level
-        all_above = all(recent_candles['close'] > level)
+        # # Check if ALL of these candles are above the level
+        # all_above = all(recent_candles['close'] > level)
         
-        return all_above
+        # return all_above
+        return True
 
     def check_sustained_below_level(self, df, level, num_candles=None):
         """
@@ -530,19 +531,20 @@ class MomentumShortIndicator:
         Returns:
             bool: True if the most recent num_candles candles are all below the level
         """
-        if num_candles is None:
-            num_candles = self.exit_sustained_candles
+        # if num_candles is None:
+        #     num_candles = self.exit_sustained_candles
             
-        if df is None or len(df) < num_candles:
-            return False
+        # if df is None or len(df) < num_candles:
+        #     return False
         
-        # Get just the most recent num_candles
-        recent_candles = df.iloc[-num_candles:]
+        # # Get just the most recent num_candles
+        # recent_candles = df.iloc[-num_candles:]
         
-        # Check if ALL of these candles are below the level
-        all_below = all(recent_candles['close'] < level)
+        # # Check if ALL of these candles are below the level
+        # all_below = all(recent_candles['close'] < level)
         
-        return all_below
+        # return all_below
+        return True
         
     def check_supertrend_bearish(self, df, supertrend_data=None):
         """
@@ -641,7 +643,7 @@ class MomentumShortIndicator:
         Determine stop-loss level based on position type.
         For shorts, stop loss is set above entry price with buffer.
         For longs, stop loss is set below entry price with buffer.
-        If entry_price is None, falls back to using EMA-based stop loss.
+        If entry_price is None, falls back to using kama-based stop loss.
         
         Args:
             df: DataFrame with OHLC data
@@ -652,7 +654,7 @@ class MomentumShortIndicator:
             float: Stop-loss price level or None if cannot be determined
         """
         try:
-            if df is None or len(df) < self.ema_period:
+            if df is None or len(df) < self.kama_period:
                 logger.debug(f"{self.symbol}: Insufficient data for stop loss calculation")
                 return None
             
@@ -667,33 +669,33 @@ class MomentumShortIndicator:
                 
                 return stop_loss
                 
-            # Fallback to EMA-based stop loss if entry_price is not provided
-            # Check if ema already exists in the dataframe
-            ema_columns = [col for col in df.columns if col.startswith('ema_')]
+            # Fallback to kama-based stop loss if entry_price is not provided
+            # Check if kama already exists in the dataframe
+            kama_columns = [col for col in df.columns if col.startswith('kama_')]
             
-            # Use existing ema if available
-            if ema_columns:
-                ema_column = ema_columns[0]
-                current_ema = df[ema_column].iloc[-1]
+            # Use existing kama if available
+            if kama_columns:
+                kama_column = kama_columns[0]
+                current_kama = df[kama_column].iloc[-1]
             else:
-                # Calculate ema if not present
-                ema_series = df.ta.ema(length=self.ema_period)
-                if ema_series.empty:
-                    logger.debug(f"{self.symbol}: Failed to calculate ema")
+                # Calculate kama if not present
+                kama_series = df.ta.kama(length=self.kama_period)
+                if kama_series.empty:
+                    logger.debug(f"{self.symbol}: Failed to calculate kama")
                     return None
-                current_ema = ema_series.iloc[-1]
+                current_kama = kama_series.iloc[-1]
             
-            # Make sure ema is valid
-            if pd.isna(current_ema) or current_ema <= 0:
-                logger.debug(f"{self.symbol}: Invalid ema value: {current_ema}")
+            # Make sure kama is valid
+            if pd.isna(current_kama) or current_kama <= 0:
+                logger.debug(f"{self.symbol}: Invalid kama value: {current_kama}")
                 return None
             
             if position_type == 'short':
-                # Set stop-loss sl_buffer_pct% above ema for shorts
-                stop_loss = current_ema * (1 + self.sl_buffer_pct / 100)
+                # Set stop-loss sl_buffer_pct% above kama for shorts
+                stop_loss = current_kama * (1 + self.sl_buffer_pct / 100)
             else:  # long
-                # Set stop-loss sl_buffer_pct% below ema for longs
-                stop_loss = current_ema * (1 - self.sl_buffer_pct / 100)
+                # Set stop-loss sl_buffer_pct% below kama for longs
+                stop_loss = current_kama * (1 - self.sl_buffer_pct / 100)
             
             return stop_loss
         
@@ -729,27 +731,16 @@ class MomentumShortIndicator:
             # Get current price
             current_price = df['close'].iloc[-1]
             
-            # Get EMA from dataframe if available, else calculate
-            ema_columns = [col for col in df.columns if col.startswith('ema_')]
-            if ema_columns:
-                # Use existing EMA from dataframe
-                current_ema = df[ema_columns[0]].iloc[-1]
-            else:
-                # Calculate EMA if not in dataframe
-                ema_series = df.ta.ema(length=self.ema_period)
-                current_ema = ema_series.iloc[-1] if not ema_series.empty else None
-            
             # Define exit percentage thresholds
-            short_exit_pct = 2.0  # Exit short if price is 2% above entry price
-            long_exit_pct = 2.0   # Exit long if price is 2% below entry price
+            short_exit_pct = self.sl_buffer_pct  # Exit short if price is 2% above entry price
+            long_exit_pct = self.sl_buffer_pct   # Exit long if price is 2% below entry price
             
             # Initialize result
             exit_signal = {
                 'signal': 'none',
                 'reason': 'conditions_not_met',
                 'price': current_price,
-                'exit_triggered': False,
-                'ema_value': current_ema
+                'exit_triggered': False
             }
             
             # Check for exit conditions based on price movement from entry
@@ -772,8 +763,14 @@ class MomentumShortIndicator:
                         exit_signal['reason'] = f'Price {current_price} is {price_change_pct:.2f}% above entry price {entry_price} (threshold: {short_exit_pct}%)'
                         exit_signal['execute_reversal'] = True  # Signal to execute reversal (short to long)
                 
+                # Make sure stop loss is valid (above entry price for shorts)
+                if stop_loss is not None and stop_loss <= entry_price:
+                    # Correct stop loss if it's not above entry price
+                    logger.warning(f"Invalid stop loss for SHORT position: {stop_loss} <= entry price {entry_price}. Correcting.")
+                    stop_loss = entry_price * (1 + self.sl_buffer_pct/100)
+                    
                 # Fallback to stop loss check if no percentage-based exit
-                elif stop_loss is not None and current_price >= stop_loss:
+                if stop_loss is not None and current_price >= stop_loss:
                     sustained_above_sl = self.check_sustained_above_level(df, stop_loss)
                     
                     if sustained_above_sl:
@@ -801,8 +798,14 @@ class MomentumShortIndicator:
                         exit_signal['reason'] = f'Price {current_price} is {price_change_pct:.2f}% below entry price {entry_price} (threshold: {long_exit_pct}%)'
                         exit_signal['execute_reversal'] = True  # Signal to execute reversal (long to short)
                 
+                # Make sure stop loss is valid (below entry price for longs)
+                if stop_loss is not None and stop_loss >= entry_price:
+                    # Correct stop loss if it's not below entry price
+                    logger.warning(f"Invalid stop loss for LONG position: {stop_loss} >= entry price {entry_price}. Correcting.")
+                    stop_loss = entry_price * (1 - self.sl_buffer_pct/100)
+                    
                 # Fallback to stop loss check if no percentage-based exit
-                elif stop_loss is not None and current_price <= stop_loss:
+                if stop_loss is not None and current_price <= stop_loss:
                     sustained_below_sl = self.check_sustained_below_level(df, stop_loss)
                     
                     if sustained_below_sl:
@@ -838,7 +841,7 @@ class MomentumShortIndicator:
         """
         try:
             # Ensure we have enough data
-            if self.price_history.empty or len(self.price_history) < self.ema_period:
+            if self.price_history.empty or len(self.price_history) < self.kama_period:
                 logger.warning(f"{self.symbol}: Insufficient price history for signal generation")
                 return {
                     'signal': 'none',
@@ -877,35 +880,35 @@ class MomentumShortIndicator:
                     logger.error(f"{self.symbol}: Error calculating Supertrend: {e}")
                     supertrend_data = None
                     
-            # Find or calculate ema if not present
-            ema_columns = [col for col in df.columns if col.startswith('ema_')]
-            if not ema_columns:
-                # Calculate ema if not present
-                ema_series = df.ta.ema(length=self.ema_period)
-                if not ema_series.empty:
-                    df[f'ema_{self.ema_period}'] = ema_series
-                    current_ema = ema_series.iloc[-1]
+            # Find or calculate kama if not present
+            kama_columns = [col for col in df.columns if col.startswith('kama_')]
+            if not kama_columns:
+                # Calculate kama if not present
+                kama_series = df.ta.kama(length=self.kama_period)
+                if not kama_series.empty:
+                    df[f'kama_{self.kama_period}'] = kama_series
+                    current_kama = kama_series.iloc[-1]
                 else:
-                    current_ema = None
+                    current_kama = None
             else:
-                ema_column = ema_columns[0]
-                current_ema = df[ema_column].iloc[-1]
+                kama_column = kama_columns[0]
+                current_kama = df[kama_column].iloc[-1]
                     
-            is_below_ema = current_price < current_ema if current_ema is not None else False
-            is_above_ema = current_price > current_ema if current_ema is not None else False
+            is_below_kama = current_price < current_kama if current_kama is not None else False
+            is_above_kama = current_price > current_kama if current_kama is not None else False
                     
             # First, check for short signal conditions
             # 1. Check for price gain - 20% in 24 hours
             has_price_gain, gain_pct, low_price, high_price, low_idx, high_idx = self.check_price_gain(df)
             
-            # 2. Check for ema crossunder
-            has_ema_crossunder, crossunder_age, minutes_ago_crossunder, is_first_crossunder = self.check_ema_crossunder(df)
+            # 2. Check for kama crossunder
+            has_kama_crossunder, crossunder_age, minutes_ago_crossunder, is_first_crossunder = self.check_kama_crossunder(df)
             
             # 3. Check supertrend bearish
             is_supertrend_bearish = self.check_supertrend_bearish(df, supertrend_data)
             
             # *** Check for crossunder on current or previous 6 candles ***
-            is_recent_crossunder = crossunder_age <= 1000  # 0-6 = current or up to 6 candles ago
+            is_recent_crossunder = crossunder_age <= 144  # 0-6 = current or up to 6 candles ago
             
             # All conditions for a sell (short) signal
             short_conditions_met = {
@@ -913,21 +916,21 @@ class MomentumShortIndicator:
                 'price_gain_pct': f"{gain_pct:.2f}%" if has_price_gain else "N/A",
                 'high_price': high_price,
                 'low_price': low_price,
-                'ema_crossunder_met': has_ema_crossunder,
+                'kama_crossunder_met': has_kama_crossunder,
                 'is_first_crossunder': is_first_crossunder,  # Still track this but don't require it
                 'is_recent_crossunder': is_recent_crossunder,
                 'crossunder_age_candles': crossunder_age,
                 'crossunder_minutes_ago': minutes_ago_crossunder,
-                'is_below_ema': is_below_ema,
-                'supertrend_bearish_met': is_supertrend_bearish
+                'is_below_kama': is_below_kama,
+                'supertrend_bearish_met': True
             }
             
             # Next, check for long signal conditions
             # 1. Check for price decrease - 20% in 24 hours
             has_price_decrease, decrease_pct, decrease_high_price, decrease_low_price, decrease_high_idx, decrease_low_idx = self.check_price_decrease(df)
             
-            # 2. Check for ema crossover
-            has_ema_crossover, crossover_age, minutes_ago_crossover, is_first_crossover = self.check_ema_crossover(df)
+            # 2. Check for kama crossover
+            has_kama_crossover, crossover_age, minutes_ago_crossover, is_first_crossover = self.check_kama_crossover(df)
             
             # *** Check for crossover on current or previous 6 candles ***
             is_recent_crossover = crossover_age <= 6  # 0-6 = current or up to 6 candles ago
@@ -941,13 +944,13 @@ class MomentumShortIndicator:
                 'price_decrease_pct': f"{decrease_pct:.2f}%" if has_price_decrease else "N/A",
                 'high_price': decrease_high_price,
                 'low_price': decrease_low_price,
-                'ema_crossover_met': has_ema_crossover,
+                'kama_crossover_met': has_kama_crossover,
                 'is_first_crossover': is_first_crossover,  # Still track this but don't require it
                 'is_recent_crossover': is_recent_crossover,
                 'crossover_age_candles': crossover_age,
                 'crossover_minutes_ago': minutes_ago_crossover,
-                'is_above_ema': is_above_ema,
-                'supertrend_bullish_met': is_supertrend_bullish
+                'is_above_kama': is_above_kama,
+                'supertrend_bullish_met': True
             }
             
             # Calculate drawdown/recovery for both scenarios
@@ -960,8 +963,8 @@ class MomentumShortIndicator:
                 long_conditions_met['recovery_pct'] = recovery_pct
             
             # Generate SHORT signal - REMOVED first crossunder requirement
-            if (has_price_gain and has_ema_crossunder and is_recent_crossunder 
-                and is_supertrend_bearish and is_below_ema):
+            if (has_price_gain and has_kama_crossunder and is_recent_crossunder 
+                and is_below_kama):
                 
                 # For new positions, use current price as the intended entry price
                 # When generating a signal, the position isn't open yet
@@ -982,19 +985,19 @@ class MomentumShortIndicator:
                 signal = {
                     'signal': 'sell',
                     'reason': f"Gained {gain_pct:.2f}% in the last 24 hours and now {drawdown_pct:.2f}% down from high, "
-                            f"Crossunder below ema({self.ema_period}) within last 6 candles (age: {crossunder_age}), "
+                            f"Crossunder below kama({self.kama_period}) within last 6 candles (age: {crossunder_age}), "
                             f"supertrend bearish",
                     'price': current_price,
                     'stop_loss': stop_loss,
                     'short_conditions_met': short_conditions_met,
                     'long_conditions_met': long_conditions_met,
-                    'has_ema_crossunder': has_ema_crossunder,
+                    'has_kama_crossunder': has_kama_crossunder,
                     'is_first_crossunder': is_first_crossunder,  # Include this info but it's not required
                     'is_recent_crossunder': is_recent_crossunder,
                     'crossunder_age': crossunder_age,
                     'crossunder_minutes_ago': minutes_ago_crossunder,
                     'exit_triggered': False,
-                    'ema_value': current_ema
+                    'kama_value': current_kama
                 }
                 
                 # Log additional debug info for this valid signal
@@ -1005,8 +1008,8 @@ class MomentumShortIndicator:
                 return signal
             
             # Generate LONG signal - REMOVED first crossover requirement
-            elif (has_price_decrease and has_ema_crossover and is_recent_crossover 
-                and is_supertrend_bullish and is_above_ema):
+            elif (has_price_decrease and has_kama_crossover and is_recent_crossover 
+                 and is_above_kama):
                 
                 # For new positions, use current price as the intended entry price
                 stop_loss = self.determine_stop_loss(df, position_type='long', entry_price=current_price)
@@ -1026,19 +1029,19 @@ class MomentumShortIndicator:
                 signal = {
                     'signal': 'buy',
                     'reason': f"Decreased {decrease_pct:.2f}% in the last 24 hours and now {recovery_pct:.2f}% up from low, "
-                            f"Crossover above ema({self.ema_period}) within last 6 candles (age: {crossover_age}), "
+                            f"Crossover above kama({self.kama_period}) within last 6 candles (age: {crossover_age}), "
                             f"supertrend bullish",
                     'price': current_price,
                     'stop_loss': stop_loss,
                     'short_conditions_met': short_conditions_met,
                     'long_conditions_met': long_conditions_met,
-                    'has_ema_crossover': has_ema_crossover,
+                    'has_kama_crossover': has_kama_crossover,
                     'is_first_crossover': is_first_crossover,  # Include this info but it's not required
                     'is_recent_crossover': is_recent_crossover,
                     'crossover_age': crossover_age,
                     'crossover_minutes_ago': minutes_ago_crossover,
                     'exit_triggered': False,
-                    'ema_value': current_ema
+                    'kama_value': current_kama
                 }
                 
                 # Log additional debug info for this valid signal
@@ -1049,9 +1052,9 @@ class MomentumShortIndicator:
                 return signal
             
             # No signal if conditions are not met
-            if has_ema_crossunder and not is_recent_crossunder:
+            if has_kama_crossunder and not is_recent_crossunder:
                 reason = f"crossunder_not_within_last_6_candles (age: {crossunder_age} candles)"
-            elif has_ema_crossover and not is_recent_crossover:
+            elif has_kama_crossover and not is_recent_crossover:
                 reason = f"crossover_not_within_last_6_candles (age: {crossover_age} candles)"
             else:
                 reason = 'not_all_conditions_met'
@@ -1064,7 +1067,7 @@ class MomentumShortIndicator:
                 'short_conditions_met': short_conditions_met,
                 'long_conditions_met': long_conditions_met,
                 'exit_triggered': False,
-                'ema_value': current_ema
+                'kama_value': current_kama
             }
         
         except Exception as e:

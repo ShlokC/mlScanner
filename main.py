@@ -12,17 +12,17 @@ from collections import defaultdict
 from MomentumShortIndicator import MomentumShortIndicator, create_momentum_short_signal_generator
 
 # Configuration
-SLEEP_INTERVAL = 2  # seconds
-MAX_OPEN_TRADES = 5
+SLEEP_INTERVAL = 1  # seconds
+MAX_OPEN_TRADES = 7
 AMOUNT_USD = 1
 TIMEFRAME = '3m'
 MOMENTUM_TIMEFRAME = '5m'  # 5-minute timeframe for momentum strategy
 LIMIT = 100
 MOMENTUM_LIMIT = 1000  # Need more candles for momentum strategy to detect 20% gain over days
 LEVERAGE_OPTIONS = [10, 8]
-ENABLE_AUTO_REVERSALS = False 
+ENABLE_AUTO_REVERSALS = True  # Enable auto-reversals for momentum strategy 
 # Anti-cycling settings
-MINIMUM_HOLD_MINUTES = 2  # Minimum time to hold a position regardless of signals (in minutes)
+MINIMUM_HOLD_MINUTES = 1  # Minimum time to hold a position regardless of signals (in minutes)
 SYMBOL_COOLDOWN_MINUTES = 15  # Time to wait before re-entering after exit (in minutes)
 
 # Thread synchronization
@@ -96,10 +96,10 @@ BASE_PARAMS = {
 MOMENTUM_PARAMS = {
     'lookback_days': 1,          # Check gains over 1 day (24 hours) instead of 3 days
     'min_price_gain': 20.0,      # At least 20% gain instead of 20%
-    'ema_period': 144,           # 288 * 5min = 24 hours
-    'supertrend_factor': 1.0,    # Standard multiplier
+    'kama_period': 40,           # 40 * 5min = 24 hours
+    'supertrend_factor': 2.0,    # Standard multiplier
     'supertrend_length': 7,      # Standard length
-    'sl_buffer_pct': 2.0         # Stop loss 2% above ema
+    'sl_buffer_pct': 6.0         # Stop loss 2% above kama
 }
 
 def fetch_extended_historical_data(exchange, symbol, timeframe=MOMENTUM_TIMEFRAME, max_candles=2980):
@@ -175,33 +175,33 @@ def fetch_extended_historical_data(exchange, symbol, timeframe=MOMENTUM_TIMEFRAM
         
         # Calculate required indicators using pandas-ta
         try:
-            # 1. EMA (Exponential Moving Average)
-            ema_period = 144  # 12 hours on 5-minute timeframe
-            ema_result = df_combined.ta.ema(length=ema_period)
-            if ema_result is not None and not ema_result.empty:
-                df_combined[f"ema_{ema_period}"] = ema_result
+            # 1. kama (Exponential Moving Average)
+            kama_period = 40  # 12 hours on 5-minute timeframe
+            kama_result = df_combined.ta.kama(length=kama_period)
+            if kama_result is not None and not kama_result.empty:
+                df_combined[f"kama_{kama_period}"] = kama_result
             else:
-                logger.warning(f"Failed to calculate EMA for {symbol} - got empty result")
-                # Fallback: calculate EMA using pandas
-                df_combined[f"ema_{ema_period}"] = df_combined['close'].ewm(span=ema_period, adjust=False).mean()
+                logger.warning(f"Failed to calculate kama for {symbol} - got empty result")
+                # Fallback: calculate kama using pandas
+                df_combined[f"kama_{kama_period}"] = df_combined['close'].ewm(span=kama_period, adjust=False).mean()
         
             # 2. Supertrend
             supertrend_length = 7
-            supertrend_factor = 1.0
+            supertrend_factor = 2.0
             supertrend_result = df_combined.ta.supertrend(length=supertrend_length, multiplier=supertrend_factor)
             if supertrend_result is not None and not isinstance(supertrend_result, type(None)) and not supertrend_result.empty:
                 for col in supertrend_result.columns:
                     df_combined[col] = supertrend_result[col]
         except Exception as e:
             logger.warning(f"Error calculating indicators for {symbol}: {e}")
-            # Provide fallback EMA calculation if the ta method fails
-            df_combined[f"ema_{ema_period}"] = df_combined['close'].ewm(span=ema_period, adjust=False).mean()
+            # Provide fallback kama calculation if the ta method fails
+            df_combined[f"kama_{kama_period}"] = df_combined['close'].ewm(span=kama_period, adjust=False).mean()
         
-        # Verify we have the EMA column
-        ema_column = f"ema_{ema_period}"
-        if ema_column not in df_combined.columns:
-            logger.warning(f"EMA column missing for {symbol} after indicator calculation - adding fallback")
-            df_combined[ema_column] = df_combined['close'].ewm(span=ema_period, adjust=False).mean()
+        # Verify we have the kama column
+        kama_column = f"kama_{kama_period}"
+        if kama_column not in df_combined.columns:
+            logger.warning(f"kama column missing for {symbol} after indicator calculation - adding fallback")
+            df_combined[kama_column] = df_combined['close'].ewm(span=kama_period, adjust=False).mean()
         
         # Final check to ensure the DataFrame has at least some data
         if df_combined.empty:
@@ -417,7 +417,7 @@ def get_momentum_indicator(symbol, exchange, force_new=False):
                 # Log the key parameters
                 # log_msg = f"Momentum Parameters: Lookback={params['lookback_days']} days, "
                 # log_msg += f"Min Gain={params['min_price_gain']}%, "
-                # log_msg += f"ema Period={params['ema_period']}, "
+                # log_msg += f"kama Period={params['kama_period']}, "
                 # log_msg += f"SL Buffer={params['sl_buffer_pct']}%"
                 # logger.info(log_msg)
                 
@@ -612,8 +612,8 @@ def can_exit_position(symbol):
             hold_time_minutes = (current_time - entry_time) / 60
             
             if hold_time_minutes < MINIMUM_HOLD_MINUTES:
-                remaining = int(MINIMUM_HOLD_MINUTES - hold_time_minutes)
-                logger.info(f"{symbol} position held for {hold_time_minutes:.1f} minutes, must hold for {remaining} more minutes")
+                rkamaining = int(MINIMUM_HOLD_MINUTES - hold_time_minutes)
+                logger.info(f"{symbol} position held for {hold_time_minutes:.1f} minutes, must hold for {rkamaining} more minutes")
                 return False
     
     return True
@@ -673,7 +673,7 @@ def fetch_active_symbols(exchange, sort_type='both', top_count=50):
                 time.sleep(0.1)
                 
                 # Fetch 5-minute candles for the last 24 hours
-                # We need approximately 288 candles for 24 hours (24 * 12), but we'll ask for 300 to be safe
+                # We need approximately 40 candles for 24 hours (24 * 12), but we'll ask for 300 to be safe
                 ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', since=twenty_four_hours_ago, limit=300)
                 
                 if not ohlcv or len(ohlcv) < 12:  # Need enough candles for meaningful calculation (at least 1 hour)
@@ -745,18 +745,18 @@ def fetch_active_symbols(exchange, sort_type='both', top_count=50):
         top_losers = losers[:top_count]
         
         # Log the top symbols
-        if logger.isEnabledFor(logging.INFO):
-            logger.info("Top gainers:")
-            for i, symbol in enumerate(top_gainers[:10]):  # Log just top 10 for brevity
-                info = price_changes[symbol]
-                logger.info(f"{i+1}. {symbol}: 24hr Price Change: {info['price_change_pct']:.2f}%, "
-                           f"Max Gain: {info['max_gain_pct']:.2f}%")
+        # if logger.isEnabledFor(logging.INFO):
+        #     logger.info("Top gainers:")
+        #     for i, symbol in enumerate(top_gainers[:10]):  # Log just top 10 for brevity
+        #         info = price_changes[symbol]
+        #         logger.info(f"{i+1}. {symbol}: 24hr Price Change: {info['price_change_pct']:.2f}%, "
+        #                    f"Max Gain: {info['max_gain_pct']:.2f}%")
                            
-            logger.info("Top losers:")
-            for i, symbol in enumerate(top_losers[:10]):  # Log just top 10 for brevity
-                info = price_changes[symbol]
-                logger.info(f"{i+1}. {symbol}: 24hr Price Change: {info['price_change_pct']:.2f}%, "
-                           f"Max Drop: {info['max_drop_pct']:.2f}%")
+        #     logger.info("Top losers:")
+        #     for i, symbol in enumerate(top_losers[:10]):  # Log just top 10 for brevity
+        #         info = price_changes[symbol]
+        #         logger.info(f"{i+1}. {symbol}: 24hr Price Change: {info['price_change_pct']:.2f}%, "
+        #                    f"Max Drop: {info['max_drop_pct']:.2f}%")
         
         # Return based on requested sort type
         if sort_type == 'both':
@@ -819,7 +819,7 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
                     # Fetch extended historical data with indicators
                     df_historical = fetch_extended_historical_data(exchange, symbol, MOMENTUM_TIMEFRAME)
                     
-                    if df_historical is None or len(df_historical) < 288:  # Need at least 24h of data
+                    if df_historical is None or len(df_historical) < 40:  # Need at least 24h of data
                         logger.debug(f"Insufficient history for {symbol}. Skipping.")
                         continue
                     
@@ -858,22 +858,22 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
                             high_price = short_conditions.get('high_price')
                             drawdown_pct = short_conditions.get('drawdown_pct', 0)
                             
-                            has_ema_crossunder = short_conditions.get('ema_crossunder_met', False)
+                            has_kama_crossunder = short_conditions.get('kama_crossunder_met', False)
                             is_first_crossunder = short_conditions.get('is_first_crossunder', False)
                             is_recent_crossunder = short_conditions.get('is_recent_crossunder', False)
                             crossunder_age = short_conditions.get('crossunder_age_candles', 0)
                             minutes_ago = short_conditions.get('crossunder_minutes_ago', 0)
                             
-                            is_below_ema = short_conditions.get('is_below_ema', False)
+                            is_below_kama = short_conditions.get('is_below_kama', False)
                             is_supertrend_bearish = short_conditions.get('supertrend_bearish_met', False)
                             
                             current_price = signal.get('price')
-                            current_ema = signal.get('ema_value')
+                            current_kama = signal.get('kama_value')
                             
-                            # Calculate ema_price_diff_pct
-                            ema_price_diff_pct = 0
-                            if current_ema is not None and current_price > 0:
-                                ema_price_diff_pct = ((current_ema - current_price) / current_price) * 100
+                            # Calculate kama_price_diff_pct
+                            kama_price_diff_pct = 0
+                            if current_kama is not None and current_price > 0:
+                                kama_price_diff_pct = ((current_kama - current_price) / current_price) * 100
                             
                             # Store candidate information
                             all_short_candidates[symbol] = {
@@ -882,8 +882,8 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
                                 'high_price': high_price,
                                 'current_price': current_price,
                                 'drawdown_pct': drawdown_pct,
-                                'is_below_ema': is_below_ema,
-                                'has_ema_crossunder': has_ema_crossunder,
+                                'is_below_kama': is_below_kama,
+                                'has_kama_crossunder': has_kama_crossunder,
                                 'is_first_crossunder': is_first_crossunder,
                                 'is_recent_crossunder': is_recent_crossunder,
                                 'crossunder_age': crossunder_age,
@@ -891,8 +891,8 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
                                 'supertrend_bearish': is_supertrend_bearish,
                                 'signal_generated': signal['signal'] == 'sell',
                                 'stop_loss': signal['stop_loss'],
-                                'ema_value': current_ema,
-                                'ema_price_diff_pct': ema_price_diff_pct
+                                'kama_value': current_kama,
+                                'kama_price_diff_pct': kama_price_diff_pct
                             }
                             
                     elif category == 'losers':
@@ -913,22 +913,22 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
                             low_price = long_conditions.get('low_price')
                             recovery_pct = long_conditions.get('recovery_pct', 0)
                             
-                            has_ema_crossover = long_conditions.get('ema_crossover_met', False)
+                            has_kama_crossover = long_conditions.get('kama_crossover_met', False)
                             is_first_crossover = long_conditions.get('is_first_crossover', False)
                             is_recent_crossover = long_conditions.get('is_recent_crossover', False)
                             crossover_age = long_conditions.get('crossover_age_candles', 0)
                             minutes_ago = long_conditions.get('crossover_minutes_ago', 0)
                             
-                            is_above_ema = long_conditions.get('is_above_ema', False)
+                            is_above_kama = long_conditions.get('is_above_kama', False)
                             is_supertrend_bullish = long_conditions.get('supertrend_bullish_met', False)
                             
                             current_price = signal.get('price')
-                            current_ema = signal.get('ema_value')
+                            current_kama = signal.get('kama_value')
                             
-                            # Calculate ema_price_diff_pct
-                            ema_price_diff_pct = 0
-                            if current_ema is not None and current_price > 0:
-                                ema_price_diff_pct = ((current_price - current_ema) / current_ema) * 100
+                            # Calculate kama_price_diff_pct
+                            kama_price_diff_pct = 0
+                            if current_kama is not None and current_price > 0:
+                                kama_price_diff_pct = ((current_price - current_kama) / current_kama) * 100
                             
                             # Store candidate information
                             all_long_candidates[symbol] = {
@@ -937,8 +937,8 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
                                 'low_price': low_price,
                                 'current_price': current_price,
                                 'recovery_pct': recovery_pct,
-                                'is_above_ema': is_above_ema,
-                                'has_ema_crossover': has_ema_crossover,
+                                'is_above_kama': is_above_kama,
+                                'has_kama_crossover': has_kama_crossover,
                                 'is_first_crossover': is_first_crossover,
                                 'is_recent_crossover': is_recent_crossover,
                                 'crossover_age': crossover_age,
@@ -946,8 +946,8 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
                                 'supertrend_bullish': is_supertrend_bullish,
                                 'signal_generated': signal['signal'] == 'buy',
                                 'stop_loss': signal['stop_loss'],
-                                'ema_value': current_ema,
-                                'ema_price_diff_pct': ema_price_diff_pct
+                                'kama_value': current_kama,
+                                'kama_price_diff_pct': kama_price_diff_pct
                             }
                 
                 except Exception as e:
@@ -963,10 +963,10 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
         
         recently_crossed_short_symbols = [
             s for s in all_short_candidates.keys() 
-            if all_short_candidates[s]['has_ema_crossunder'] and 
+            if all_short_candidates[s]['has_kama_crossunder'] and 
             all_short_candidates[s]['is_recent_crossunder'] and
             all_short_candidates[s]['supertrend_bearish'] and
-            all_short_candidates[s]['is_below_ema'] and
+            all_short_candidates[s]['is_below_kama'] and
             s not in short_ready_symbols
         ]
         
@@ -982,8 +982,8 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
         sorted_short_ready = sorted(
             short_ready_symbols,
             key=lambda x: (
-                0 if all_short_candidates[x]['has_ema_crossunder'] else 1,
-                all_short_candidates[x]['crossunder_minutes_ago'] if all_short_candidates[x]['has_ema_crossunder'] else 999,
+                0 if all_short_candidates[x]['has_kama_crossunder'] else 1,
+                all_short_candidates[x]['crossunder_minutes_ago'] if all_short_candidates[x]['has_kama_crossunder'] else 999,
                 -all_short_candidates[x]['drawdown_pct']
             )
         )
@@ -991,31 +991,31 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
         # Combine all short groups with priority order
         sorted_short_symbols = sorted_recently_crossed_short + sorted_short_ready
         
-        # Add remaining short symbols based on ema crossunder status
-        remaining_short_symbols = set(all_short_candidates.keys()) - set(sorted_short_symbols)
+        # Add rkamaining short symbols based on kama crossunder status
+        rkamaining_short_symbols = set(all_short_candidates.keys()) - set(sorted_short_symbols)
         
-        sorted_remaining_short = sorted(
-            remaining_short_symbols,
+        sorted_rkamaining_short = sorted(
+            rkamaining_short_symbols,
             key=lambda x: (
-                0 if all_short_candidates[x]['has_ema_crossunder'] else 1,
+                0 if all_short_candidates[x]['has_kama_crossunder'] else 1,
                 0 if all_short_candidates[x]['is_recent_crossunder'] else 1,
-                all_short_candidates[x]['crossunder_age'] if all_short_candidates[x]['has_ema_crossunder'] else 999,
+                all_short_candidates[x]['crossunder_age'] if all_short_candidates[x]['has_kama_crossunder'] else 999,
                 -all_short_candidates[x]['drawdown_pct'],
                 -all_short_candidates[x]['gain_pct']
             )
         )
         
-        sorted_short_symbols.extend(sorted_remaining_short)
+        sorted_short_symbols.extend(sorted_rkamaining_short)
         
         # Prioritize LONG candidates
         long_ready_symbols = [s for s in all_long_candidates.keys() if all_long_candidates[s]['signal_generated']]
         
         recently_crossed_long_symbols = [
             s for s in all_long_candidates.keys() 
-            if all_long_candidates[s]['has_ema_crossover'] and 
+            if all_long_candidates[s]['has_kama_crossover'] and 
             all_long_candidates[s]['is_recent_crossover'] and
             all_long_candidates[s]['supertrend_bullish'] and
-            all_long_candidates[s]['is_above_ema'] and
+            all_long_candidates[s]['is_above_kama'] and
             s not in long_ready_symbols
         ]
         
@@ -1031,8 +1031,8 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
         sorted_long_ready = sorted(
             long_ready_symbols,
             key=lambda x: (
-                0 if all_long_candidates[x]['has_ema_crossover'] else 1,
-                all_long_candidates[x]['crossover_minutes_ago'] if all_long_candidates[x]['has_ema_crossover'] else 999,
+                0 if all_long_candidates[x]['has_kama_crossover'] else 1,
+                all_long_candidates[x]['crossover_minutes_ago'] if all_long_candidates[x]['has_kama_crossover'] else 999,
                 -all_long_candidates[x]['recovery_pct']
             )
         )
@@ -1040,21 +1040,21 @@ def find_momentum_candidates(exchange, sort_type='both', limit=20):
         # Combine all long groups with priority order
         sorted_long_symbols = sorted_recently_crossed_long + sorted_long_ready
         
-        # Add remaining long symbols based on ema crossover status
-        remaining_long_symbols = set(all_long_candidates.keys()) - set(sorted_long_symbols)
+        # Add rkamaining long symbols based on kama crossover status
+        rkamaining_long_symbols = set(all_long_candidates.keys()) - set(sorted_long_symbols)
         
-        sorted_remaining_long = sorted(
-            remaining_long_symbols,
+        sorted_rkamaining_long = sorted(
+            rkamaining_long_symbols,
             key=lambda x: (
-                0 if all_long_candidates[x]['has_ema_crossover'] else 1,
+                0 if all_long_candidates[x]['has_kama_crossover'] else 1,
                 0 if all_long_candidates[x]['is_recent_crossover'] else 1,
-                all_long_candidates[x]['crossover_age'] if all_long_candidates[x]['has_ema_crossover'] else 999,
+                all_long_candidates[x]['crossover_age'] if all_long_candidates[x]['has_kama_crossover'] else 999,
                 -all_long_candidates[x]['recovery_pct'],
                 -all_long_candidates[x]['decrease_pct']
             )
         )
         
-        sorted_long_symbols.extend(sorted_remaining_long)
+        sorted_long_symbols.extend(sorted_rkamaining_long)
         
         # Log top candidates
         if len(sorted_short_symbols) > 0:
@@ -1309,7 +1309,7 @@ def get_order_quantity(exchange, market_id, price, leverage):
 
 def sync_positions_with_exchange(exchange):
     """Synchronize local position tracking with exchange positions."""
-    logger.info("Synchronizing positions with exchange...")
+    # logger.info("Synchronizing positions with exchange...")
     
     try:
         # Get current positions from exchange
@@ -1355,7 +1355,7 @@ def sync_positions_with_exchange(exchange):
             
             logger.info(f"Recovered {position_type} position for {symbol} at entry price {entry_price}")
         
-        logger.info(f"Position synchronization complete. Found {len(exchange_symbols)} active positions on exchange.")
+        # logger.info(f"Position synchronization complete. Found {len(exchange_symbols)} active positions on exchange.")
                   
     except Exception as e:
         logger.exception(f"Error synchronizing positions: {e}")
@@ -1482,311 +1482,14 @@ def momentum_trading_loop(exchange):
             # Check for position exits and handle existing positions
             open_positions = fetch_open_positions(exchange)
             
-            # Periodically update reference stop losses for momentum positions
-            try:
-                update_momentum_stop_losses(exchange, update_all_positions=False)
-            except Exception as e:
-                logger.exception(f"Error updating stop losses: {e}")
-                
-            # Process position exits and potential reversals
-            for symbol in open_positions:
-                try:
-                    # Get position details from exchange
-                    position = open_positions[symbol]
-                    position_amt = float(position['info'].get('positionAmt', 0))
-                    
-                    # Skip if position amount is negligible
-                    if abs(position_amt) < 1e-9:
-                        logger.warning(f"Position amount for {symbol} is zero. Skipping.")
-                        continue
-                    
-                    # Determine current position direction
-                    current_position_type = 'long' if position_amt > 0 else 'short'
-                    
-                    # Get local position details
-                    with position_details_lock:
-                        if symbol not in position_details:
-                            logger.warning(f"Position details not found locally for {symbol}. Creating default.")
-                            # Create default position details if missing
-                            entry_price = float(position['info'].get('entryPrice', 0))
-                            
-                            # Get extended historical data with indicators
-                            df_historical = fetch_extended_historical_data(exchange, symbol, MOMENTUM_TIMEFRAME)
-                            if df_historical is None or len(df_historical) < 1000:  # Need sufficient data
-                                logger.warning(f"Insufficient historical data for {symbol}. Skipping.")
-                                continue
-                            
-                            # Get the momentum indicator for this symbol to access ema calculation
-                            indicator = get_momentum_indicator(symbol, exchange)
-                            if indicator is None:
-                                logger.error(f"Failed to get momentum indicator for {symbol}. Skipping.")
-                                continue
-                            
-                            # Update the indicator with the historical data
-                            indicator.update_price_data(df_historical)
-                            
-                            # Get ema column
-                            ema_column = [col for col in df_historical.columns if col.startswith('ema_')]
-                            if not ema_column:
-                                logger.warning(f"ema column not found in historical data for {symbol}. Skipping.")
-                                continue
-                            
-                            current_ema = df_historical[ema_column[0]].iloc[-1]
-                            
-                            # ema-based stop loss - using the indicator's sl_buffer_pct
-                            if current_position_type == 'long':
-                                # For long, SL is below ema
-                                stop_loss = current_ema * (1 - indicator.sl_buffer_pct / 100)
-                            else:
-                                # For short, SL is above ema
-                                stop_loss = current_ema * (1 + indicator.sl_buffer_pct / 100)
-                            
-                            position_details[symbol] = {
-                                'entry_price': entry_price,
-                                'stop_loss': stop_loss,
-                                'position_type': current_position_type,
-                                'entry_reason': 'Recovery',
-                                'entry_time': time.time() - 3600,  # Assume 1hr ago
-                                'highest_reached': entry_price if current_position_type == 'long' else None,
-                                'lowest_reached': entry_price if current_position_type == 'short' else None,
-                                'ema_value': current_ema
-                            }
-                        
-                        pos_details = position_details[symbol].copy()
-                    
-                    # Get fresh extended historical data
-                    df_historical = fetch_extended_historical_data(exchange, symbol, MOMENTUM_TIMEFRAME)
-                    
-                    # Skip if we don't have data
-                    if df_historical is None or len(df_historical) < 200:
-                        logger.warning(f"No valid historical data for {symbol}. Skipping.")
-                        continue
-                    
-                    # Get the momentum indicator for this symbol
-                    indicator = get_momentum_indicator(symbol, exchange)
-                    if indicator is None:
-                        logger.warning(f"Failed to get momentum indicator for {symbol}. Using existing SL.")
-                        continue
-                    
-                    # Update the indicator with historical data
-                    indicator.update_price_data(df_historical)
-                    
-                    # Get current ema value
-                    ema_column = [col for col in df_historical.columns if col.startswith('ema_')]
-                    if not ema_column:
-                        logger.warning(f"ema column not found in historical data for {symbol}. Skipping.")
-                        continue
-                    
-                    current_ema = df_historical[ema_column[0]].iloc[-1]
-                    
-                    # Update ema value in position details
-                    with position_details_lock:
-                        if symbol in position_details:
-                            position_details[symbol]['ema_value'] = current_ema
-                            
-                            # Dynamically calculate exit levels based on current ema
-                            if current_position_type == 'long':
-                                # For long, exit below ema with buffer
-                                updated_stop_loss = current_ema * (1 - indicator.sl_buffer_pct / 100)
-                            else:
-                                # For short, exit above ema with buffer
-                                updated_stop_loss = current_ema * (1 + indicator.sl_buffer_pct / 100)
-                            
-                            position_details[symbol]['stop_loss'] = updated_stop_loss
-                            
-                    # Get the updated position details
-                    with position_details_lock:
-                        pos_details = position_details[symbol].copy()
-                    
-                    # Extract details
-                    entry_price = pos_details.get('entry_price')
-                    stop_loss = pos_details.get('stop_loss')
-                    position_type = pos_details.get('position_type')
-                    ema_value = pos_details.get('ema_value')
-                    
-                    # Get exit signal from the indicator
-                    exit_signal = indicator.generate_signal(
-                        current_position=position_type,
-                        entry_price=entry_price,
-                        stop_loss=stop_loss
-                    )
-                    
-                    # Check if exit is triggered according to the indicator
-                    exit_triggered = exit_signal.get('exit_triggered', False)
-                    execute_reversal = exit_signal.get('execute_reversal', False)
-                    
-                    # Log current position status
-                    logger.debug(f"{symbol} {position_type}: Entry: {entry_price}, "
-                             f"{'ema-buffer' if position_type == 'long' else 'ema+buffer'}: {stop_loss}, ema: {ema_value}")
-                    
-                    # Execute exit and potential reversal if triggered
-                    if exit_triggered and can_exit_position(symbol):
-                        exit_reason = exit_signal.get('reason', 'Exit conditions met')
-                        current_price = exit_signal.get('price', stop_loss)
-                        
-                        logger.info(f"EXIT TRIGGERED for {symbol} {position_type} | Reason: {exit_reason} | "
-                                  f"Price: {current_price}, {'ema-buffer' if position_type == 'long' else 'ema+buffer'}: {stop_loss}")
-                        
-                        # Validate the position still exists and get the current amount
-                        try:
-                            current_positions = exchange.fetch_positions([symbol])
-                            if not current_positions or len(current_positions) == 0:
-                                logger.warning(f"Position for {symbol} no longer exists. Cleaning up local tracking.")
-                                with position_details_lock:
-                                    if symbol in position_details:
-                                        del position_details[symbol]
-                                continue
-                                
-                            current_position = current_positions[0]
-                            current_position_amt = float(current_position['info'].get('positionAmt', 0))
-                            
-                            # Check if position amount is zero or negligible
-                            if abs(current_position_amt) < 1e-9:
-                                logger.warning(f"Position amount for {symbol} is zero. Cleaning up local tracking.")
-                                with position_details_lock:
-                                    if symbol in position_details:
-                                        del position_details[symbol]
-                                continue
-                                
-                            # Verify position direction matches what we think it is
-                            current_position_direction = 'long' if current_position_amt > 0 else 'short'
-                            if current_position_direction != position_type:
-                                logger.warning(f"Position direction mismatch for {symbol}: Expected {position_type}, found {current_position_direction}. Updating.")
-                                position_type = current_position_direction
-                                
-                            # Use the actual position amount from the exchange
-                            quantity = abs(current_position_amt)
-                            
-                        except Exception as e:
-                            logger.error(f"Error validating position for {symbol}: {e}")
-                            # Continue with the amount we have locally, but log the issue
-                            quantity = abs(position_amt)
-                            logger.warning(f"Using local position amount for {symbol}: {quantity}")
-                        
-                        # Determine exit side and potential reversal side
-                        exit_side = 'buy' if position_type == 'short' else 'sell'
-                        
-                        # For reversal, we'll do opposite of current position
-                        reversal_side = 'buy' if position_type == 'short' else 'sell'
-                        new_position_type = 'long' if position_type == 'short' else 'short'
-                        
-                        # Set leverage for the exit and potential reversal
-                        leverage = get_leverage_for_market(exchange, symbol)
-                        if not leverage:
-                            logger.error(f"Failed to set leverage for {symbol}. Using default.")
-                            leverage = 10  # Default fallback
-                        
-                        # Step 1: Exit the current position
-                        logger.info(f"Exiting {position_type} position for {symbol} - Qty: {quantity}")
-                        exit_order = place_order(
-                            exchange, symbol, exit_side, quantity, current_price, 
-                            leverage=leverage, reduceOnly=True
-                        )
-                        
-                        if not exit_order:
-                            logger.error(f"Failed to exit {position_type} position for {symbol}. Cannot proceed with reversal.")
-                            continue
-                        
-                        # Brief pause to ensure exit is processed
-                        time.sleep(1)
-                        
-                        # Only reverse position if the indicator says to do so
-                        if execute_reversal and ENABLE_AUTO_REVERSALS:
-                            # Step 2: Enter new position in the opposite direction
-                            logger.info(f"Reversing to {new_position_type} position for {symbol} - Qty: {quantity}")
-                            
-                            # Verify the position is closed before opening a new one
-                            try:
-                                current_positions = exchange.fetch_positions([symbol])
-                                if current_positions and len(current_positions) > 0:
-                                    current_pos_amt = float(current_positions[0]['info'].get('positionAmt', 0))
-                                    if abs(current_pos_amt) > 1e-9:
-                                        logger.warning(f"Position for {symbol} still exists with amount {current_pos_amt}. Cannot reverse yet.")
-                                        
-                                        # Try once more to close it
-                                        close_side = 'buy' if current_pos_amt < 0 else 'sell'
-                                        close_amt = abs(current_pos_amt)
-                                        logger.info(f"Attempting forced close for {symbol}: {close_side} {close_amt}")
-                                        close_order = place_order(exchange, symbol, close_side, close_amt, current_price, reduceOnly=True)
-                                        if close_order:
-                                            logger.info(f"Forced close order placed for {symbol}")
-                                            time.sleep(1)
-                                        else:
-                                            logger.error(f"Failed to force close {symbol}. Skipping reversal.")
-                                            continue
-                            except Exception as e:
-                                logger.error(f"Error verifying position closure for {symbol}: {e}")
-                            
-                            # Now attempt to open the new position
-                            entry_order = place_order(
-                                exchange, symbol, reversal_side, quantity, current_price,
-                                leverage=leverage, reduceOnly=False
-                            )
-                            
-                            if not entry_order:
-                                logger.error(f"Failed to enter {new_position_type} position for {symbol} after successful exit.")
-                                
-                                # Clean up position details since we exited but failed to re-enter
-                                with position_details_lock:
-                                    if symbol in position_details:
-                                        del position_details[symbol]
-                                continue
-                            
-                            # Position successfully reversed - update position details
-                            executed_price = entry_order.get('average', current_price)
-                            
-                            # Get fresh historical data for updated ema
-                            new_df_historical = fetch_extended_historical_data(exchange, symbol, MOMENTUM_TIMEFRAME)
-                            ema_column = [col for col in new_df_historical.columns if col.startswith('ema_')] if new_df_historical is not None else []
-                            if new_df_historical is not None and ema_column:
-                                current_ema = new_df_historical[ema_column[0]].iloc[-1]
-                            
-                                # Calculate new stop loss based on ema
-                                if new_position_type == 'long':
-                                    # For long, SL is below ema
-                                    sl_price = current_ema * (1 - indicator.sl_buffer_pct / 100)
-                                else:
-                                    # For short, SL is above ema
-                                    sl_price = current_ema * (1 + indicator.sl_buffer_pct / 100)
-                            else:
-                                # Fallback if we can't get fresh data
-                                sl_price = executed_price * (0.97 if new_position_type == 'long' else 1.03)
-                                current_ema = None
-                            
-                            # Update position details
-                            with position_details_lock:
-                                position_details[symbol] = {
-                                    'entry_price': executed_price,
-                                    'stop_loss': sl_price,
-                                    'position_type': new_position_type,
-                                    'entry_reason': f"Position Reversal (from {position_type})",
-                                    'entry_time': time.time(),
-                                    'highest_reached': executed_price if new_position_type == 'long' else None,
-                                    'lowest_reached': executed_price if new_position_type == 'short' else None,
-                                    'signal_type': 'reversal',
-                                    'signal_strength': 60,
-                                    'leverage': leverage,
-                                    'ema_value': current_ema
-                                }
-                            
-                            logger.info(f"Successfully reversed {symbol} from {position_type} to {new_position_type} at {executed_price}. "
-                                      f"Reference SL: {sl_price}, ema: {current_ema}")
-                        else:
-                            # If reversal not indicated, just clean up
-                            logger.info(f"Exited {position_type} position for {symbol} without reversal (indicator decision).")
-                            
-                            # Clean up position details
-                            with position_details_lock:
-                                if symbol in position_details:
-                                    del position_details[symbol]
-                
-                except Exception as e:
-                    logger.exception(f"Error processing position exit for {symbol}: {e}")
+            # Synchronize local position tracking with exchange positions
+            # This will automatically clean up any positions that were closed by SL/TP orders
+            sync_positions_with_exchange(exchange)
             
             # Check if we can look for new entries
-            open_positions = fetch_open_positions(exchange)  # Refresh after processing exits
+            open_positions = fetch_open_positions(exchange)  # Refresh after sync
             if len(open_positions) >= MAX_OPEN_TRADES:
-                logger.info(f"At maximum number of open trades ({len(open_positions)}/{MAX_OPEN_TRADES}). Skipping new entries.")
+                # logger.info(f"At maximum number of open trades ({len(open_positions)}/{MAX_OPEN_TRADES}). Skipping new entries.")
                 time.sleep(SLEEP_INTERVAL * 3)
                 continue  # Skip to next loop iteration, don't look for new entries
             
@@ -1831,20 +1534,13 @@ def momentum_trading_loop(exchange):
                     
                     # Look for valid SHORT signals only
                     if signal['signal'] == 'sell':
-                        # Process short entry - implementation skipped for brevity
-                        # This would be similar to the existing code in momentum_short_trading_loop()
-                        
                         current_price = signal['price']
-                        has_ema_crossunder = signal.get('has_ema_crossunder', False)
+                        has_kama_crossunder = signal.get('has_kama_crossunder', False)
                         crossunder_age = signal.get('crossunder_age', 0)
                         minutes_ago = signal.get('crossunder_minutes_ago', 0)
                         
                         logger.info(f"MOMENTUM SHORT SIGNAL: {symbol} - {signal['reason']}")
                         
-                        if signal['stop_loss'] is None or not isinstance(signal['stop_loss'], (int, float)) or signal['stop_loss'] <= 0:
-                            logger.error(f"Invalid stop loss for {symbol}: {signal['stop_loss']}. Skipping.")
-                            continue
-                            
                         leverage = get_leverage_for_market(exchange, symbol)
                         if not leverage:
                             logger.error(f"Failed to set leverage for {symbol}. Skipping.")
@@ -1856,12 +1552,19 @@ def momentum_trading_loop(exchange):
                             logger.warning(f"Invalid quantity calculated for {symbol}. Skipping.")
                             continue
                             
-                        current_ema = signal.get('ema_value')
+                        current_kama = signal.get('kama_value')
+                        
+                        # Calculate fixed SL and TP based on entry price and leverage
+                        # For short, SL is 60% loss of position value
+                        stop_loss = current_price * (1 + 0.6/leverage)
+                        # Target is 100% gain
+                        target_price = current_price * (1 - 1/leverage)
                             
                         with position_details_lock:
                             position_details[symbol] = {
                                 'entry_price': current_price,
-                                'stop_loss': signal['stop_loss'],
+                                'stop_loss': stop_loss,
+                                'target': target_price,
                                 'position_type': 'short',
                                 'entry_reason': f"Momentum Short: {signal['reason']}",
                                 'probability': signal.get('probability', 0.7),
@@ -1870,9 +1573,10 @@ def momentum_trading_loop(exchange):
                                 'lowest_reached': current_price,
                                 'signal_type': 'momentum_short',
                                 'signal_strength': 70,
-                                'ema_value': current_ema,
+                                'kama_value': current_kama,
                                 'crossunder_age': crossunder_age,
-                                'crossunder_minutes_ago': minutes_ago
+                                'crossunder_minutes_ago': minutes_ago,
+                                'leverage': leverage
                             }
                             
                         logger.info(f"Placing momentum short for {symbol} at {current_price} "
@@ -1889,10 +1593,23 @@ def momentum_trading_loop(exchange):
                             with position_details_lock:
                                 if symbol in position_details:
                                     position_details[symbol]['entry_price'] = executed_price
+                                    # Update SL and TP with executed price
+                                    position_details[symbol]['stop_loss'] = executed_price * (1 + 0.6/leverage)
+                                    position_details[symbol]['target'] = executed_price * (1 - 1/leverage)
+                                    stop_loss = position_details[symbol]['stop_loss']
+                                    target_price = position_details[symbol]['target']
                             
-                            sl_level = signal['stop_loss']
-                            logger.info(f"Position opened without static SL order. Will dynamically check for exit conditions.")
-                            logger.info(f"Current ema: {current_ema}, Entry: {executed_price}, Reference exit level: {sl_level}")
+                            logger.info(f"Position opened for {symbol} with fixed SL at {stop_loss} and TP at {target_price}")
+                            
+                            # Place SL and TP orders
+                            # place_sl_tp_orders(
+                            #     exchange, 
+                            #     symbol, 
+                            #     'sell',  # Entry side was sell for short
+                            #     quantity, 
+                            #     stop_loss, 
+                            #     target_price
+                            # )
                             
                             entry_placed = True
                             
@@ -1949,19 +1666,13 @@ def momentum_trading_loop(exchange):
                         
                         # Look for valid LONG signals only
                         if signal['signal'] == 'buy':
-                            # Process long entry - this is similar to the short entry logic but for longs
-                            
                             current_price = signal['price']
-                            has_ema_crossover = signal.get('has_ema_crossover', False)
+                            has_kama_crossover = signal.get('has_kama_crossover', False)
                             crossover_age = signal.get('crossover_age', 0)
                             minutes_ago = signal.get('crossover_minutes_ago', 0)
                             
                             logger.info(f"MOMENTUM LONG SIGNAL: {symbol} - {signal['reason']}")
                             
-                            if signal['stop_loss'] is None or not isinstance(signal['stop_loss'], (int, float)) or signal['stop_loss'] <= 0:
-                                logger.error(f"Invalid stop loss for {symbol}: {signal['stop_loss']}. Skipping.")
-                                continue
-                                
                             leverage = get_leverage_for_market(exchange, symbol)
                             if not leverage:
                                 logger.error(f"Failed to set leverage for {symbol}. Skipping.")
@@ -1973,12 +1684,19 @@ def momentum_trading_loop(exchange):
                                 logger.warning(f"Invalid quantity calculated for {symbol}. Skipping.")
                                 continue
                                 
-                            current_ema = signal.get('ema_value')
+                            current_kama = signal.get('kama_value')
+                            
+                            # Calculate fixed SL and TP based on entry price and leverage
+                            # For long, SL is 60% loss of position value
+                            stop_loss = current_price * (1 - 0.6/leverage)
+                            # Target is 100% gain
+                            target_price = current_price * (1 + 1/leverage)
                                 
                             with position_details_lock:
                                 position_details[symbol] = {
                                     'entry_price': current_price,
-                                    'stop_loss': signal['stop_loss'],
+                                    'stop_loss': stop_loss,
+                                    'target': target_price,
                                     'position_type': 'long',
                                     'entry_reason': f"Momentum Long: {signal['reason']}",
                                     'probability': signal.get('probability', 0.7),
@@ -1987,9 +1705,10 @@ def momentum_trading_loop(exchange):
                                     'lowest_reached': None,
                                     'signal_type': 'momentum_long',
                                     'signal_strength': 70,
-                                    'ema_value': current_ema,
+                                    'kama_value': current_kama,
                                     'crossover_age': crossover_age,
-                                    'crossover_minutes_ago': minutes_ago
+                                    'crossover_minutes_ago': minutes_ago,
+                                    'leverage': leverage
                                 }
                                 
                             logger.info(f"Placing momentum long for {symbol} at {current_price} "
@@ -2006,10 +1725,23 @@ def momentum_trading_loop(exchange):
                                 with position_details_lock:
                                     if symbol in position_details:
                                         position_details[symbol]['entry_price'] = executed_price
+                                        # Update SL and TP with executed price
+                                        position_details[symbol]['stop_loss'] = executed_price * (1 - 0.6/leverage)
+                                        position_details[symbol]['target'] = executed_price * (1 + 1/leverage)
+                                        stop_loss = position_details[symbol]['stop_loss']
+                                        target_price = position_details[symbol]['target']
                                 
-                                sl_level = signal['stop_loss']
-                                logger.info(f"Position opened without static SL order. Will dynamically check for exit conditions.")
-                                logger.info(f"Current ema: {current_ema}, Entry: {executed_price}, Reference exit level: {sl_level}")
+                                logger.info(f"Position opened for {symbol} with fixed SL at {stop_loss} and TP at {target_price}")
+                                
+                                # Place SL and TP orders
+                                # place_sl_tp_orders(
+                                #     exchange, 
+                                #     symbol, 
+                                #     'buy',  # Entry side was buy for long
+                                #     quantity, 
+                                #     stop_loss, 
+                                #     target_price
+                                # )
                                 
                                 entry_placed = True
                                 
@@ -2037,7 +1769,6 @@ def momentum_trading_loop(exchange):
         except Exception as e:
             logger.exception(f"Error in momentum trading loop: {e}")
             time.sleep(SLEEP_INTERVAL * 5)
-
 
 def main():
     """Main function to start the trading bot."""
