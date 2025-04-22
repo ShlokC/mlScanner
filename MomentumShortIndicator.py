@@ -12,21 +12,15 @@ logger = logging.getLogger(__name__)
 
 class MomentumShortIndicator:
     """
-    Indicator for identifying short selling and long buying opportunities and exit points in crypto markets.
+    Indicator for identifying short selling opportunities and exit points in crypto markets.
     
     Short Entry Criteria:
     1. Coin has gained 20%+ in last 1-3 days (using 5-min candles)
     2. Price has crossed below kama(40) on 5-min candle after being above for multiple candles
     3. Supertrend indicator is red (bearish) on 5-min candle
     
-    Long Entry Criteria:
-    1. Coin has decreased 20%+ in last 1-3 days (using 5-min candles)
-    2. Price has crossed above kama(40) on 5-min candle after being below for multiple candles
-    3. Supertrend indicator is green (bullish) on 5-min candle
-    
     Exit Criteria:
     1. For shorts: Price sustainably above stop loss (kama+buffer) or entry price
-    2. For longs: Price sustainably below stop loss (kama-buffer) or entry price
     """
     
     def __init__(self, 
@@ -957,7 +951,11 @@ class MomentumShortIndicator:
             if has_price_gain and high_price:
                 drawdown_pct = ((high_price - current_price) / high_price) * 100 if high_price > 0 else 0
                 short_conditions_met['drawdown_pct'] = drawdown_pct
-            
+                
+                # Add this check: Calculate the ratio of drawdown to gain
+                drawdown_to_gain_ratio = drawdown_pct / gain_pct if gain_pct > 0 else 0
+                short_conditions_met['drawdown_to_gain_ratio'] = drawdown_to_gain_ratio
+
             if has_price_decrease and decrease_low_price:
                 recovery_pct = ((current_price - decrease_low_price) / decrease_low_price) * 100 if decrease_low_price > 0 else 0
                 long_conditions_met['recovery_pct'] = recovery_pct
@@ -966,6 +964,20 @@ class MomentumShortIndicator:
             if (has_price_gain and has_kama_crossunder and is_recent_crossunder 
                 and is_below_kama):
                 
+                # Add this check: Skip trades that have already retraced too much of their gain
+                drawdown_to_gain_ratio = short_conditions_met.get('drawdown_to_gain_ratio', 0)
+                if drawdown_to_gain_ratio > 0.7:  # If retraced more than 70% of the gain
+                    logger.info(f"Skipping SHORT signal for {self.symbol}: Price already retraced {drawdown_pct:.2f}% which is {drawdown_to_gain_ratio:.2f}x of its {gain_pct:.2f}% gain")
+                    return {
+                        'signal': 'none',
+                        'reason': f'price_already_retraced_too_much (drawdown {drawdown_pct:.2f}% is {drawdown_to_gain_ratio:.2f}x of gain)',
+                        'price': current_price,
+                        'stop_loss': None,
+                        'short_conditions_met': short_conditions_met,
+                        'long_conditions_met': long_conditions_met,
+                        'exit_triggered': False,
+                        'kama_value': current_kama
+                    }
                 # For new positions, use current price as the intended entry price
                 # When generating a signal, the position isn't open yet
                 stop_loss = self.determine_stop_loss(df, position_type='short', entry_price=current_price)
@@ -1004,50 +1016,6 @@ class MomentumShortIndicator:
                 logger.info(f"VALID SHORT SIGNAL for {self.symbol}: Crossunder within last 6 candles, "
                         f"on candle {crossunder_age}, {minutes_ago_crossunder} minutes ago, drawdown: {drawdown_pct:.2f}%, "
                         f"Entry: {current_price}, SL: {stop_loss} ({self.sl_buffer_pct}% above entry)")
-                
-                return signal
-            
-            # Generate LONG signal - REMOVED first crossover requirement
-            elif (has_price_decrease and has_kama_crossover and is_recent_crossover 
-                 and is_above_kama):
-                
-                # For new positions, use current price as the intended entry price
-                stop_loss = self.determine_stop_loss(df, position_type='long', entry_price=current_price)
-                
-                if stop_loss is None or stop_loss <= 0:
-                    return {
-                        'signal': 'none',
-                        'reason': 'invalid_stop_loss',
-                        'price': current_price,
-                        'stop_loss': None,
-                        'short_conditions_met': short_conditions_met,
-                        'long_conditions_met': long_conditions_met,
-                        'exit_triggered': False
-                    }
-                
-                # Generate buy signal
-                signal = {
-                    'signal': 'buy',
-                    'reason': f"Decreased {decrease_pct:.2f}% in the last 24 hours and now {recovery_pct:.2f}% up from low, "
-                            f"Crossover above kama({self.kama_period}) within last 6 candles (age: {crossover_age}), "
-                            f"supertrend bullish",
-                    'price': current_price,
-                    'stop_loss': stop_loss,
-                    'short_conditions_met': short_conditions_met,
-                    'long_conditions_met': long_conditions_met,
-                    'has_kama_crossover': has_kama_crossover,
-                    'is_first_crossover': is_first_crossover,  # Include this info but it's not required
-                    'is_recent_crossover': is_recent_crossover,
-                    'crossover_age': crossover_age,
-                    'crossover_minutes_ago': minutes_ago_crossover,
-                    'exit_triggered': False,
-                    'kama_value': current_kama
-                }
-                
-                # Log additional debug info for this valid signal
-                logger.info(f"VALID LONG SIGNAL for {self.symbol}: Crossover within last 6 candles, "
-                        f"on candle {crossover_age}, {minutes_ago_crossover} minutes ago, recovery: {recovery_pct:.2f}%, "
-                        f"Entry: {current_price}, SL: {stop_loss} ({self.sl_buffer_pct}% below entry)")
                 
                 return signal
             
