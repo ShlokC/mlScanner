@@ -13,12 +13,13 @@ from MomentumShortIndicator import MomentumShortIndicator, create_momentum_short
 
 # Configuration
 SLEEP_INTERVAL = 1  # seconds
-MAX_OPEN_TRADES = 7
-AMOUNT_USD = 1
+MAX_OPEN_TRADES = 5  # Maximum number of open trades at any time
+BASE_AMOUNT_USD = 1 # Starting position size
+MAX_AMOUNT_USD = 3.0  # Maximum position size
+AMOUNT_INCREMENT = 0.5  # Position size increments
 TIMEFRAME = '3m'
 MOMENTUM_TIMEFRAME = '5m'  # 5-minute timeframe for momentum strategy
 LIMIT = 100
-MOMENTUM_LIMIT = 1000  # Need more candles for momentum strategy to detect 20% gain over days
 LEVERAGE_OPTIONS = [10, 8]
 ENABLE_AUTO_REVERSALS = True  # Enable auto-reversals for momentum strategy 
 # Anti-cycling settings
@@ -34,6 +35,14 @@ consecutive_stop_loss_lock = threading.Lock()  # Lock for thread safety
 # Position details dictionary for enhanced trade tracking
 position_details = {}  # {symbol: {'entry_price', 'stop_loss', 'target', 'position_type', 'entry_reason', 'probability', 'entry_time'}}
 position_details_lock = threading.Lock()  # Lock for accessing position details
+
+# NEW: Performance tracking for position sizing
+trade_performance = {}  # {symbol: [list of completed trade results]}
+performance_lock = threading.Lock()  # Lock for accessing performance data
+
+# NEW: Pyramid tracking
+pyramid_details = {}  # {symbol: {'count': 0, 'entries': []}}
+pyramid_lock = threading.Lock()  # Lock for pyramid data
 
 # Global metrics to track trade filtering
 global_metrics = {
@@ -101,6 +110,44 @@ MOMENTUM_PARAMS = {
     'supertrend_length': 7,      # Standard length
     'sl_buffer_pct': 6.0         # Stop loss 2% above kama
 }
+
+# NEW: Configuration for pyramiding
+PYRAMID_CONFIG = {
+    'max_entries': 3,              # Maximum number of pyramid entries per position
+    'profit_thresholds': [15, 30, 45],  # Profit thresholds for adding positions (%)
+    'size_multipliers': [1.0, 1.5, 2.0]  # Size multipliers for each pyramid entry
+}
+
+# NEW: Configuration for reversal handling
+REVERSAL_CONFIG = {
+    'min_profit_for_reversal': 5,  # Minimum profit % to consider reversal
+    'reversal_size_multiplier': 1.5,  # Multiplier for position size on reversal
+    'max_reversal_size': 3.0,      # Maximum position size for reversal entries
+    'min_reversal_strength': 60    # Minimum reversal strength to trigger reversal (0-100)
+}
+def calculate_position_profit(entry_price, current_price, position_type, leverage=1):
+    """
+    Calculate actual position profit percentage including leverage effect.
+    
+    Args:
+        entry_price: Original entry price
+        current_price: Current price
+        position_type: 'long' or 'short'
+        leverage: Position leverage multiplier
+        
+    Returns:
+        float: Position profit percentage with leverage applied
+    """
+    # Calculate raw price change percentage
+    if position_type == 'long':
+        price_change_pct = ((current_price - entry_price) / entry_price) * 100
+    else:  # short
+        price_change_pct = ((entry_price - current_price) / entry_price) * 100
+        
+    # Apply leverage multiplier to get actual position profit
+    position_profit_pct = price_change_pct * leverage
+    
+    return position_profit_pct
 
 def fetch_extended_historical_data(exchange, symbol, timeframe=MOMENTUM_TIMEFRAME, max_candles=2980):
     """
@@ -396,6 +443,332 @@ def log_trade_metrics(reason, increment=True):
         logger.info("Trade metrics reset")
 
 
+# NEW: Method for calculating position size based on performance
+def calculate_position_size(symbol, base_size=BASE_AMOUNT_USD, max_size=MAX_AMOUNT_USD, increment=AMOUNT_INCREMENT):
+    """
+    Calculate position size based on recent performance
+    """
+    position_size = base_size
+    
+    with performance_lock:
+        if symbol in trade_performance and trade_performance[symbol]:
+            # Get the last 5 trades (or less if fewer exist)
+            recent_trades = trade_performance[symbol][-5:]
+            
+            # Count profitable trades
+            profitable_trades = sum(1 for trade in recent_trades if trade.get('profit_pct', 0) > 0)
+            
+            # Adjust position size based on number of profitable trades
+            position_size = min(base_size + (increment * profitable_trades), max_size)
+            
+            # Additional adjustment based on last trade's performance
+            if recent_trades and 'profit_pct' in recent_trades[-1]:
+                last_profit = recent_trades[-1]['profit_pct']
+                
+                # Increase size after strong win
+                if last_profit > 15:
+                    position_size = min(position_size + increment, max_size)
+                    logger.info(f"Increasing position size for {symbol} due to strong last trade: {last_profit:.1f}%")
+                # Decrease size after loss
+                elif last_profit < 0 and profitable_trades < 2:
+                    position_size = max(base_size, position_size - increment)
+                    logger.info(f"Decreasing position size for {symbol} due to recent loss: {last_profit:.1f}%")
+    
+    logger.info(f"Calculated position size for {symbol}: ${position_size} based on performance")
+    return position_size
+
+# NEW: Function to check for pyramid opportunity
+# MODIFIED: Function to check for pyramid opportunity
+def check_for_pyramid_opportunity(exchange, symbol):
+    """
+    Check if we should add to an existing position via pyramiding.
+    Uses ADAPTIVE logic based on absolute price movements from high/low
+    instead of percentage-based thresholds.
+
+    Returns:
+        tuple: (should_pyramid, size_to_add, reason)
+    """
+    try:
+        with position_details_lock:
+            if symbol not in position_details:
+                return False, 0, "No active position"
+
+            position_info = position_details[symbol].copy()
+
+        # Get pyramid details
+        with pyramid_lock:
+            pyramid_info = pyramid_details.get(symbol, {'count': 0, 'entries': []})
+            pyramid_count = pyramid_info.get('count', 0)
+
+        # Check if we've reached maximum pyramid entries
+        if pyramid_count >= PYRAMID_CONFIG['max_entries']:
+            return False, 0, f"Maximum pyramid count reached ({pyramid_count})"
+
+        # Get position details
+        position_type = position_info.get('position_type')
+        entry_price = position_info.get('entry_price')
+        current_total_size = position_info.get('position_size', BASE_AMOUNT_USD)
+        leverage = position_info.get('leverage', 10)
+
+        # Get current position value from exchange position data
+        current_position_value = current_total_size  # Default fallback
+        try:
+            open_positions = fetch_open_positions(exchange)
+            if symbol in open_positions:
+                pos_data = open_positions[symbol]['info']
+                current_position_value = float(pos_data.get('initialMargin', current_total_size))
+                logger.debug(f"Position values for {symbol}: Exchange reports initialMargin={current_position_value}, "
+                           f"tracking has position_size={current_total_size}")
+        except Exception as e:
+            logger.warning(f"Error getting position value from exchange for {symbol}: {e}")
+        
+        # Use the higher of our tracked value and exchange-reported value for safety
+        current_total_size = max(current_total_size, current_position_value)
+        
+        # Check if current position already at max size
+        if current_total_size >= MAX_AMOUNT_USD:
+            logger.info(f"Cannot pyramid {symbol}: Position size ${current_total_size:.2f} already at or exceeds max ${MAX_AMOUNT_USD:.2f}")
+            return False, 0, f"Position already at maximum size (${current_total_size:.2f})"
+
+        # Get the momentum indicator instance
+        indicator = get_momentum_indicator(symbol, exchange)
+        if not indicator:
+            logger.warning(f"Cannot check pyramid for {symbol}: Failed to get momentum indicator")
+            return False, 0, "Failed to get indicator"
+
+        # Fetch fresh data for indicator analysis
+        df_historical = fetch_extended_historical_data(exchange, symbol, MOMENTUM_TIMEFRAME)
+        if df_historical is None or len(df_historical) < max(indicator.kama_period, 100):
+             logger.warning(f"Insufficient historical data for {symbol} pyramid check.")
+             return False, 0, "Insufficient historical data"
+
+        # Get current price
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = ticker['last']
+
+        # Minimum remaining potential threshold (10%)
+        MIN_REMAINING_POTENTIAL = 10.0
+        
+        # Number of pyramid levels to use for calculations
+        TOTAL_PYRAMID_LEVELS = PYRAMID_CONFIG['max_entries']
+        
+        potential_pyramid_level = -1
+        target_entry_price_for_level = -1.0
+        size_to_add = AMOUNT_INCREMENT  # MODIFIED: Use fixed AMOUNT_INCREMENT
+        reason_for_entry = "No adaptive pyramid opportunity detected"
+
+        # Logic for SHORT positions
+        if position_type == 'short':
+            logger.debug(f"Checking adaptive pyramid for SHORT {symbol}")
+
+            # Get the most recent significant gain details
+            has_gain, gain_pct, low_price_gain, high_price, low_idx_gain, high_idx_gain = indicator.check_price_gain(df_historical)
+
+            if not has_gain or high_price is None or gain_pct <= 0:
+                logger.debug(f"No significant gain basis found for {symbol} SHORT pyramid.")
+                return False, 0, "No significant gain basis for pyramid"
+
+            # Calculate current drawdown from high price
+            drawdown_pct = ((high_price - current_price) / high_price) * 100
+
+            # Calculate remaining potential downside percentage
+            remaining_potential_pct = gain_pct - drawdown_pct
+
+            # Check minimum remaining potential
+            if remaining_potential_pct < MIN_REMAINING_POTENTIAL:
+                logger.debug(f"Skipping SHORT pyramid for {symbol}: Remaining potential {remaining_potential_pct:.2f}% < {MIN_REMAINING_POTENTIAL}% (Gain: {gain_pct:.2f}%, Drawdown: {drawdown_pct:.2f}%)")
+                return False, 0, f"Remaining potential too low ({remaining_potential_pct:.1f}%)"
+
+            # MODIFIED: Calculate pyramid levels dynamically 
+            # Each level is equally spaced between 0 and (gain_pct - MIN_REMAINING_POTENTIAL)
+            usable_range_pct = gain_pct - MIN_REMAINING_POTENTIAL
+            level_size_pct = usable_range_pct / TOTAL_PYRAMID_LEVELS
+            
+            # Check which pyramid level the current price is at
+            for i in range(pyramid_count, TOTAL_PYRAMID_LEVELS):
+                # Calculate target drawdown percentage for this level
+                target_drawdown_pct = level_size_pct * (i + 1)
+                
+                # Calculate the target entry price (price drops by target_drawdown_pct from high_price)
+                target_entry_price = high_price * (1 - target_drawdown_pct / 100.0)
+
+                # Check if current price meets or is below this target entry price
+                if current_price <= target_entry_price:
+                    logger.info(f"Adaptive Short Pyramid Trigger Check for {symbol} Level {i+1}: "
+                               f"Current Price {current_price:.6f} <= Target Price {target_entry_price:.6f} "
+                               f"(Target Drop: {target_drawdown_pct:.2f}% of total range {usable_range_pct:.2f}%)")
+                    
+                    # Store the *first* level triggered in this check cycle
+                    if potential_pyramid_level == -1:
+                        potential_pyramid_level = i
+                        target_entry_price_for_level = target_entry_price
+                        reason_for_entry = (f"Adaptive Short Pyramid Level {potential_pyramid_level + 1}: Price <= {target_entry_price_for_level:.6f} "
+                                           f"(Target Drop: {target_drawdown_pct:.2f}% of total range {usable_range_pct:.2f}%)")
+                    # Continue checking subsequent levels in case multiple triggered
+                else:
+                    logger.debug(f"Adaptive Short Pyramid Condition NOT MET for {symbol} Level {i+1}: "
+                               f"Current Price {current_price:.6f} > Target Price {target_entry_price:.6f}")
+                    # Stop checking further levels for shorts if one isn't met
+                    break
+
+        # Logic for LONG positions
+        elif position_type == 'long':
+            logger.debug(f"Checking adaptive pyramid for LONG {symbol}")
+
+            # Get the most recent significant decrease details
+            has_decrease, decrease_pct, high_price_dec, low_price, high_idx_dec, low_idx_dec = indicator.check_price_decrease(df_historical)
+
+            if not has_decrease or low_price is None or decrease_pct <= 0:
+                logger.debug(f"No significant decrease basis found for {symbol} LONG pyramid.")
+                return False, 0, "No significant decrease basis for pyramid"
+
+            # Calculate current recovery from the low price
+            recovery_pct = ((current_price - low_price) / low_price) * 100 if low_price > 0 else 0
+
+            # Calculate remaining potential upside percentage
+            remaining_potential_pct = decrease_pct - recovery_pct
+
+            # Check minimum remaining potential
+            if remaining_potential_pct < MIN_REMAINING_POTENTIAL:
+                logger.debug(f"Skipping LONG pyramid for {symbol}: Remaining potential {remaining_potential_pct:.2f}% < {MIN_REMAINING_POTENTIAL}% (Decrease: {decrease_pct:.2f}%, Recovery: {recovery_pct:.2f}%)")
+                return False, 0, f"Remaining potential too low ({remaining_potential_pct:.1f}%)"
+
+            # MODIFIED: Calculate pyramid levels dynamically
+            # Each level is equally spaced between 0 and (decrease_pct - MIN_REMAINING_POTENTIAL)
+            usable_range_pct = decrease_pct - MIN_REMAINING_POTENTIAL
+            level_size_pct = usable_range_pct / TOTAL_PYRAMID_LEVELS
+            
+            # Check which pyramid level the current price is at
+            for i in range(pyramid_count, TOTAL_PYRAMID_LEVELS):
+                # Calculate target recovery percentage for this level
+                target_recovery_pct = level_size_pct * (i + 1)
+                
+                # Calculate the target entry price (price recovers by target_recovery_pct from low_price)
+                target_entry_price = low_price * (1 + target_recovery_pct / 100.0)
+
+                # Check if current price meets or is above this target entry price
+                if current_price >= target_entry_price:
+                    logger.info(f"Adaptive Long Pyramid Trigger Check for {symbol} Level {i+1}: "
+                               f"Current Price {current_price:.6f} >= Target Price {target_entry_price:.6f} "
+                               f"(Target Recovery: {target_recovery_pct:.2f}% of total range {usable_range_pct:.2f}%)")
+                    
+                    # Store the *first* level triggered in this check cycle
+                    if potential_pyramid_level == -1:
+                        potential_pyramid_level = i
+                        target_entry_price_for_level = target_entry_price
+                        reason_for_entry = (f"Adaptive Long Pyramid Level {potential_pyramid_level + 1}: Price >= {target_entry_price_for_level:.6f} "
+                                           f"(Target Recovery: {target_recovery_pct:.2f}% of total range {usable_range_pct:.2f}%)")
+                    # Continue checking subsequent levels in case multiple triggered
+                else:
+                    logger.debug(f"Adaptive Long Pyramid Condition NOT MET for {symbol} Level {i+1}: "
+                               f"Current Price {current_price:.6f} < Target Price {target_entry_price:.6f}")
+                    # Stop checking further levels for longs if one isn't met
+                    break
+
+        else: # Handle unknown position type
+             logger.warning(f"Unknown position type '{position_type}' for {symbol} in pyramid check.")
+             return False, 0, "Unknown position type"
+
+        # If a pyramid level's condition was met (either short or long)
+        if potential_pyramid_level != -1:
+            # MODIFIED: Always use fixed AMOUNT_INCREMENT for size_to_add
+            add_size_raw = AMOUNT_INCREMENT
+            
+            # Ensure we respect MAX_AMOUNT_USD using the more accurate current_total_size
+            capped_add_size = max(0.0, min(add_size_raw, MAX_AMOUNT_USD - current_total_size))
+
+            # Avoid adding trivially small amounts
+            if capped_add_size < (AMOUNT_INCREMENT / 2.0):
+                 logger.info(f"Pyramid add size for {symbol} is too small ({capped_add_size:.2f} USD), skipping.")
+                 return False, 0, f"Calculated add size {capped_add_size:.2f} too small"
+
+            logger.info(f"Adaptive Pyramid Size Calculation: Adding fixed amount {AMOUNT_INCREMENT}, "
+                       f"CurrentTotal={current_total_size:.2f}, "
+                       f"MaxTotal={MAX_AMOUNT_USD:.2f}, CappedAdd={capped_add_size:.2f}")
+
+            # Return True, the calculated size TO ADD, and the reason
+            return True, capped_add_size, reason_for_entry
+        else:
+            # No levels triggered for the relevant position type
+            return False, 0, reason_for_entry # Return the reason why no levels were triggered
+
+    except Exception as e:
+        logger.error(f"Error checking pyramid opportunity for {symbol}: {e}", exc_info=True)
+        return False, 0, f"Error: {str(e)}"
+    
+def close_partial_position(exchange, symbol, side, quantity, current_price, reduceOnly=True):
+    """
+    Close a portion of an open position.
+    
+    Args:
+        exchange: CCXT exchange instance
+        symbol: Trading pair symbol
+        side: Order side ('buy' or 'sell')
+        quantity: Position quantity to close
+        current_price: Current market price (for logging)
+        reduceOnly: Whether to use reduceOnly flag
+        
+    Returns:
+        order object or None on failure
+    """
+    try:
+        logger.info(f"Closing partial position for {symbol}: {side.upper()} {quantity:.8f} @ ~{current_price:.6f}")
+        
+        # Place the order
+        order = place_order(
+            exchange,
+            symbol,
+            side,
+            quantity,
+            current_price,
+            reduceOnly=reduceOnly
+        )
+        
+        if order:
+            logger.info(f"Partial position close successful for {symbol}, order ID: {order.get('id', 'N/A')}")
+            return order
+        else:
+            logger.error(f"Failed to close partial position for {symbol}")
+            return None
+            
+    except Exception as e:
+        logger.exception(f"Error closing partial position for {symbol}: {e}")
+        return None
+
+# NEW: Function to record trade results for performance tracking
+def record_trade_result(symbol, entry_price, exit_price, position_type, entry_time, exit_time=None, leverage=10):
+    """
+    Record the results of a completed trade for performance tracking.
+    Entry price can be the average entry price for pyramided positions.
+    """
+    if exit_time is None:
+        exit_time = time.time()
+        
+    # Calculate profit WITH LEVERAGE ADJUSTMENT
+    profit_pct = calculate_position_profit(entry_price, exit_price, position_type, leverage)
+    
+    # Record trade details
+    trade_result = {
+        'symbol': symbol,
+        'entry_price': entry_price,
+        'exit_price': exit_price,
+        'position_type': position_type,
+        'entry_time': entry_time,
+        'exit_time': exit_time,
+        'duration_minutes': (exit_time - entry_time) / 60,
+        'profit_pct': profit_pct,
+        'is_profitable': profit_pct > 0,
+        'leverage': leverage
+    }
+    
+    # Save to performance history
+    with performance_lock:
+        if symbol not in trade_performance:
+            trade_performance[symbol] = []
+        trade_performance[symbol].append(trade_result)
+    
+    logger.info(f"Recorded trade result for {symbol}: {profit_pct:.2f}% profit over {trade_result['duration_minutes']:.1f} minutes [with {leverage}x leverage]")
+    return trade_result
 
 def get_momentum_indicator(symbol, exchange, force_new=False):
     """Get or create momentum short indicator for a symbol."""
@@ -583,6 +956,8 @@ def get_position_details(symbol, entry_price, position_type, position_entry_time
             'entry_time': position_entry_times.get(symbol, time.time()),
             'highest_reached': entry_price if position_type == 'long' else None,
             'lowest_reached': entry_price if position_type == 'short' else None,
+            'position_size': BASE_AMOUNT_USD,  # Default position size
+            'max_profit_pct': 0
         }
         
         with position_details_lock:
@@ -600,6 +975,8 @@ def get_position_details(symbol, entry_price, position_type, position_entry_time
             'entry_time': time.time() - 3600,
             'highest_reached': entry_price if position_type == 'long' else None,
             'lowest_reached': entry_price if position_type == 'short' else None,
+            'position_size': BASE_AMOUNT_USD,
+            'max_profit_pct': 0
         }
 
 
@@ -612,8 +989,8 @@ def can_exit_position(symbol):
             hold_time_minutes = (current_time - entry_time) / 60
             
             if hold_time_minutes < MINIMUM_HOLD_MINUTES:
-                rkamaining = int(MINIMUM_HOLD_MINUTES - hold_time_minutes)
-                logger.info(f"{symbol} position held for {hold_time_minutes:.1f} minutes, must hold for {rkamaining} more minutes")
+                remaining = int(MINIMUM_HOLD_MINUTES - hold_time_minutes)
+                logger.info(f"{symbol} position held for {hold_time_minutes:.1f} minutes, must hold for {remaining} more minutes")
                 return False
     
     return True
@@ -971,26 +1348,62 @@ def get_leverage_for_market(exchange, market_id, leverage_options=LEVERAGE_OPTIO
         return None
 
 def fetch_open_positions(exchange):
-    """Fetch open positions from the exchange."""
+    """Fetch open positions from the exchange with margin information."""
     try:
         positions = exchange.fetch_positions()
-        return {
-            pos['symbol']: {
-                'symbol': pos['symbol'],
-                'info': {
-                    'positionAmt': str(float(pos['info'].get('positionAmt', 0))),
-                    'entryPrice': pos['info'].get('entryPrice', '0')
+        result = {}
+        
+        for pos in positions:
+            # Filter only positions with non-zero amount
+            position_amt = float(pos['info'].get('positionAmt', 0))
+            if abs(position_amt) > 0:
+                symbol = pos['symbol']
+                entry_price = float(pos['info'].get('entryPrice', 0))
+                
+                # Get initialMargin if available or calculate it
+                initial_margin = pos.get('initialMargin', None)
+                leverage = pos.get('leverage', 10)  # Default to 10x if not available
+                
+                # Calculate notional value (position size in USD)
+                notional_value = abs(position_amt * entry_price)
+                
+                # If initialMargin is not available, estimate it
+                if initial_margin is None or initial_margin == 0:
+                    # Calculate based on notional value and leverage
+                    initial_margin = notional_value / leverage
+                
+                # Get current market price for current value calculation
+                try:
+                    ticker = exchange.fetch_ticker(symbol)
+                    current_price = ticker['last']
+                    current_value = abs(position_amt * current_price)
+                except Exception:
+                    # Fallback to entry price if can't get current price
+                    current_price = entry_price
+                    current_value = notional_value
+                
+                # Add all info to the position record
+                result[symbol] = {
+                    'symbol': symbol,
+                    'info': {
+                        'positionAmt': str(position_amt),
+                        'entryPrice': str(entry_price),
+                        'initialMargin': str(initial_margin),
+                        'leverage': str(leverage),
+                        'notionalValue': str(notional_value),
+                        'currentValue': str(current_value)
+                    }
                 }
-            }
-            for pos in positions if abs(float(pos['info'].get('positionAmt', 0))) > 0
-        }
+        
+        return result
     except Exception as e:
         logger.exception(f"Error fetching positions: {e}")
         return {}
 
 def place_order(exchange, market_id, side, quantity, price, leverage=None, reduceOnly=False):
     """
-    Simplified order placement function that just places a market order.
+    Simplified order placement function that places a market order.
+    Ensures isolated margin mode is set before placing the order.
     Properly handles the reduceOnly parameter with fallback for errors.
     """
     params = {}
@@ -1000,6 +1413,29 @@ def place_order(exchange, market_id, side, quantity, price, leverage=None, reduc
         params['reduceOnly'] = True
 
     try:
+        # First, ensure the margin mode is set to "Isolated"
+        try:
+            # Check current margin mode
+            position_info = exchange.fetch_positions([market_id])
+            if position_info and len(position_info) > 0:
+                current_margin_mode = position_info[0].get('marginMode')
+                
+                # If not in isolated mode, set it to isolated
+                if current_margin_mode != 'isolated':
+                    # logger.info(f"Changing margin mode for {market_id} from {current_margin_mode} to isolated")
+                    exchange.set_margin_mode('isolated', market_id)
+                    # Small delay to ensure the change takes effect
+                    time.sleep(0.5)
+            else:
+                # If no position info available, set to isolated mode anyway
+                # logger.info(f"Setting margin mode for {market_id} to isolated")
+                exchange.set_margin_mode('isolated', market_id)
+                time.sleep(0.5)
+                
+        except Exception as e:
+            logger.warning(f"Error checking/setting margin mode for {market_id}: {e}")
+            # Continue with order placement as some exchanges may set isolated mode automatically
+
         # Get current market price
         ticker_data = exchange.fetch_ticker(market_id)
         latest_market_price = ticker_data['last']
@@ -1035,6 +1471,118 @@ def place_order(exchange, market_id, side, quantity, price, leverage=None, reduc
     except Exception as e:
         logger.exception(f"Error placing order for {market_id}: {e}")
         return None
+
+def place_tp_only_order(exchange, market_id, entry_side, quantity, leverage=10, retries=2):
+    """
+    Place only a take-profit order with pyramid-adaptive profit target.
+    
+    Args:
+        exchange: CCXT exchange instance
+        market_id: Trading pair symbol
+        entry_side: Side of the entry order ('buy' or 'sell')
+        quantity: Position size
+        leverage: Position leverage (default: 10)
+        retries: Number of retry attempts if order fails
+        
+    Returns:
+        bool: Success or failure
+    """
+    # Get current market price and position details
+    try:
+        current_price = exchange.fetch_ticker(market_id)['last']
+        logger.info(f"Setting TP for {market_id} at current price: {current_price}")
+        
+        # Get position details to verify against entry price
+        with position_details_lock:
+            if market_id in position_details:
+                entry_price = position_details[market_id].get('entry_price', current_price)
+                position_leverage = position_details[market_id].get('leverage', leverage)
+            else:
+                entry_price = current_price
+                position_leverage = leverage
+        
+        # Get pyramid level for adaptive TP
+        with pyramid_lock:
+            pyramid_info = pyramid_details.get(market_id, {'count': 0, 'entries': []})
+            pyramid_count = pyramid_info.get('count', 0)
+            
+        # Adjust TP target based on pyramid level - more aggressive with deeper pyramids
+        base_profit_multiplier = 2.0  # 200% profit target baseline
+        
+        # Scale down profit target as pyramid count increases (more conservative)
+        if pyramid_count >= PYRAMID_CONFIG['max_entries']:
+            # At max pyramid level, target 150% profit instead of 200%
+            profit_multiplier = base_profit_multiplier * 0.75
+        elif pyramid_count > 0:
+            # Scale down by 0.1x for each pyramid level
+            profit_multiplier = base_profit_multiplier * (1.0 - 0.1 * pyramid_count)
+        else:
+            profit_multiplier = base_profit_multiplier
+            
+        # Calculate target price with adjusted multiplier
+        if entry_side == 'buy':  # LONG
+            # For longs: TP at adjusted profit % = entry + profit_multiplier * position value
+            target_price = entry_price * (1 + profit_multiplier/position_leverage)
+            
+            # Validate TP is above current price 
+            if target_price <= current_price:
+                logger.warning(f"Invalid TP for {market_id} LONG: TP {target_price} <= Current {current_price}")
+                # Set a reasonable TP at 10% above current price if validation fails
+                target_price = current_price * 1.10
+                logger.info(f"Corrected TP to {target_price}")
+                
+        else:  # SHORT
+            # For shorts: TP at adjusted profit % = entry - profit_multiplier * position value
+            target_price = entry_price * (1 - profit_multiplier/position_leverage)
+            
+            # Validate TP is below current price for shorts
+            if target_price >= current_price:
+                logger.warning(f"Invalid TP for {market_id} SHORT: TP {target_price} >= Current {current_price}")
+                # Set a reasonable TP at 10% below current price if validation fails
+                target_price = current_price * 0.90
+                logger.info(f"Corrected TP to {target_price}")
+    
+    except Exception as e:
+        logger.warning(f"Error calculating TP price for {market_id}: {e}")
+        return False
+
+    # For TP orders, we want the opposite side of our entry
+    inverted_side = 'sell' if entry_side == 'buy' else 'buy'
+
+    try:
+        # Place Take Profit order
+        tp_params = {
+            'stopPrice': exchange.price_to_precision(market_id, target_price),
+            'reduceOnly': True,
+            'timeInForce': 'GTE_GTC',
+        }
+        
+        logger.info(f"Placing TP Order ({profit_multiplier*100:.0f}% profit) for {market_id}: {inverted_side.upper()} "
+                   f"Qty:{quantity:.8f} @ Stop:{tp_params['stopPrice']}")
+        
+        tp_order = exchange.create_order(
+            market_id, 'TAKE_PROFIT_MARKET', inverted_side, quantity, None, params=tp_params
+        )
+        
+        logger.info(f"TP order {tp_order.get('id', 'N/A')} placed for {market_id} at {tp_params['stopPrice']} ({profit_multiplier*100:.0f}% profit target)")
+
+        # Store only the TP order ID
+        with position_details_lock:
+            if market_id in position_details:
+                position_details[market_id]['tp_order_id'] = tp_order.get('id')
+                position_details[market_id]['target'] = target_price
+                
+        return True
+
+    except Exception as e:
+        # Handle retries if configured
+        if retries > 0:
+            logger.warning(f"Error placing TP order for {market_id}, retrying ({retries} attempts left): {e}")
+            time.sleep(1)  # Wait before retry
+            return place_tp_only_order(exchange, market_id, entry_side, quantity, leverage, retries-1)
+        else:
+            logger.error(f"Failed to place TP order for {market_id} after all retry attempts: {e}")
+            return False
 
 def place_sl_tp_orders(exchange, market_id, entry_side, quantity, stop_loss, target_price, retries=2):
     """Place stop-loss and take-profit orders with enhanced validation."""
@@ -1137,22 +1685,177 @@ def place_sl_tp_orders(exchange, market_id, entry_side, quantity, stop_loss, tar
         logger.error(f"Error placing SL/TP orders for {market_id}: {e}")
         return False
 
-def get_order_quantity(exchange, market_id, price, leverage):
-    """Calculate order quantity based on AMOUNT_USD and leverage."""
+# NEW: Enhanced order quantity calculation considering position size
+def get_order_quantity(exchange, market_id, price, leverage, position_size=None):
+    """Calculate order quantity based on position size and leverage."""
     try:
+        # Use position_size if provided, otherwise use BASE_AMOUNT_USD
+        amount_usd = position_size if position_size is not None else BASE_AMOUNT_USD
+        
         market = exchange.markets[market_id]
         min_notional = market['limits']['cost']['min']
         min_quantity = market['limits']['amount']['min']
-        quantity = (AMOUNT_USD * leverage) / price
+        quantity = (amount_usd * leverage) / price
         notional = quantity * price
+        
+        # Ensure minimum notional value
         if notional < min_notional:
             quantity = min_notional / price
+        
+        # Log calculation details
+        logger.info(f"Calculated order quantity for {market_id}: {quantity:.8f} (${amount_usd} × {leverage} leverage)")
+        
         return max(quantity, min_quantity)
     except Exception as e:
         logger.exception(f"Error calculating quantity for {market_id}: {e}")
         return 0.0
 
-
+# NEW: Function to handle position reversals
+def handle_position_reversal(exchange, symbol, reversal_strength, current_position_type, profit_pct=0):
+    """
+    Handle position reversal when a reversal signal is detected.
+    Closes existing position and opens new one in opposite direction.
+    
+    Args:
+        exchange: CCXT exchange instance
+        symbol: Trading pair symbol
+        reversal_strength: 0-100 strength score of reversal signal
+        current_position_type: 'long' or 'short'
+        profit_pct: Current profit percentage (already leverage-adjusted)
+        
+    Returns:
+        bool: Success or failure
+    """
+    try:
+        # Check if reversal meets minimum criteria
+        if reversal_strength < REVERSAL_CONFIG['min_reversal_strength']:
+            logger.info(f"Reversal signal for {symbol} too weak ({reversal_strength}) to trigger automatic reversal")
+            return False
+            
+        # Check if we have minimum profit for reversal
+        # profit_pct is already leverage-adjusted from the calling function
+        if profit_pct < REVERSAL_CONFIG['min_profit_for_reversal']:
+            logger.info(f"Insufficient profit ({profit_pct:.1f}%) for {symbol} reversal. Minimum: {REVERSAL_CONFIG['min_profit_for_reversal']}%")
+            return False
+        
+        # Fetch current position details
+        with position_details_lock:
+            if symbol not in position_details:
+                logger.warning(f"Cannot reverse position for {symbol}: No position details found")
+                return False
+                
+            position_info = position_details[symbol].copy()
+        
+        # Get position details
+        entry_price = position_info.get('entry_price')
+        current_size = position_info.get('position_size', BASE_AMOUNT_USD)
+        
+        # Get latest market price
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = ticker['last']
+        
+        # Determine new position type
+        new_position_type = 'long' if current_position_type == 'short' else 'short'
+        
+        # Determine new entry side
+        new_entry_side = 'buy' if new_position_type == 'long' else 'sell'
+        
+        # Calculate reversal position size (larger than original when profitable)
+        reversal_size = min(current_size * REVERSAL_CONFIG['reversal_size_multiplier'], MAX_AMOUNT_USD)
+        
+        # Get leverage
+        leverage = position_info.get('leverage', 10)  # Use existing leverage if available
+        if not leverage:
+            leverage = get_leverage_for_market(exchange, symbol)
+        if not leverage:
+            logger.error(f"Failed to set leverage for {symbol} reversal")
+            return False
+            
+        # Calculate quantity
+        quantity = get_order_quantity(exchange, symbol, current_price, leverage, reversal_size)
+        if quantity <= 0:
+            logger.warning(f"Invalid quantity calculated for {symbol} reversal")
+            return False
+            
+        # Log reversal details
+        logger.info(f"EXECUTING REVERSAL for {symbol}: {current_position_type.upper()} → {new_position_type.upper()} "
+                   f"with {reversal_strength} strength at {current_price}. "
+                   f"Size: ${current_size} → ${reversal_size}, Leverage: {leverage}x")
+        
+        # Record completion of previous trade
+        record_trade_result(
+            symbol, 
+            entry_price, 
+            current_price, 
+            current_position_type, 
+            position_info.get('entry_time', time.time() - 3600),
+            leverage=leverage  # Pass leverage for proper profit calculation
+        )
+        
+        # Place order for new position
+        order = place_order(exchange, symbol, new_entry_side, quantity, current_price, leverage)
+        
+        if not order:
+            logger.error(f"Failed to execute reversal order for {symbol}")
+            return False
+            
+        # Calculate stop loss for the new position
+        indicator = get_momentum_indicator(symbol, exchange)
+        if indicator:
+            df = fetch_extended_historical_data(exchange, symbol, MOMENTUM_TIMEFRAME)
+            if df is not None and len(df) > 0:
+                indicator.update_price_data(df)
+                stop_loss = indicator.determine_stop_loss(df, position_type=new_position_type, entry_price=current_price)
+            else:
+                # Fallback SL calculation
+                stop_loss = current_price * (1 - 0.06/leverage if new_position_type == 'long' else 1 + 0.06/leverage)
+        else:
+            # Fallback SL calculation
+            stop_loss = current_price * (1 - 0.06/leverage if new_position_type == 'long' else 1 + 0.06/leverage)
+        
+        # Calculate target price (2x risk)
+        if new_position_type == 'long':
+            sl_distance = current_price - stop_loss
+            target_price = current_price + (sl_distance * 2)
+        else:  # short
+            sl_distance = stop_loss - current_price
+            target_price = current_price - (sl_distance * 2)
+            
+        # Reset pyramid count for this symbol
+        with pyramid_lock:
+            pyramid_details[symbol] = {'count': 0, 'entries': []}
+            
+        # Update position details
+        with position_details_lock:
+            position_details[symbol] = {
+                'entry_price': current_price,
+                'stop_loss': stop_loss,
+                'target': target_price,
+                'position_type': new_position_type,
+                'entry_reason': f"Reversal from {current_position_type} with strength {reversal_strength}",
+                'entry_time': time.time(),
+                'position_size': reversal_size,
+                'leverage': leverage,
+                'highest_reached': current_price if new_position_type == 'long' else None,
+                'lowest_reached': current_price if new_position_type == 'short' else None,
+                'max_profit_pct': 0
+            }
+            
+        # Place TP order for new position (skip SL order since we use dynamic management)
+        place_tp_only_order(
+            exchange, 
+            symbol, 
+            new_entry_side, 
+            quantity, 
+            leverage
+        )
+        
+        logger.info(f"Successfully reversed position for {symbol} to {new_position_type.upper()} with ${reversal_size}")
+        return True
+        
+    except Exception as e:
+        logger.exception(f"Error handling position reversal for {symbol}: {e}")
+        return False
 
 def sync_positions_with_exchange(exchange):
     """Synchronize local position tracking with exchange positions."""
@@ -1174,7 +1877,25 @@ def sync_positions_with_exchange(exchange):
             
             with position_details_lock:
                 if symbol in position_details:
+                    # Record trade result before removing from tracking
+                    current_price = exchange.fetch_ticker(symbol)['last']
+                    position_info = position_details[symbol]
+                    
+                    record_trade_result(
+                        symbol,
+                        position_info.get('entry_price'),
+                        current_price,
+                        position_info.get('position_type'),
+                        position_info.get('entry_time')
+                    )
+                    
+                    # Remove from tracking
                     del position_details[symbol]
+            
+            # Reset pyramid count for this symbol
+            with pyramid_lock:
+                if symbol in pyramid_details:
+                    del pyramid_details[symbol]
         
         # Check for positions that exist on exchange but not locally
         new_positions = exchange_symbols - local_symbols
@@ -1198,7 +1919,13 @@ def sync_positions_with_exchange(exchange):
                     'entry_time': time.time() - 3600,  # Assume 1 hour ago
                     'highest_reached': entry_price if position_type == 'long' else None,
                     'lowest_reached': entry_price if position_type == 'short' else None,
+                    'position_size': BASE_AMOUNT_USD,  # Default size
+                    'max_profit_pct': 0
                 }
+            
+            # Initialize pyramid tracking for this symbol
+            with pyramid_lock:
+                pyramid_details[symbol] = {'count': 0, 'entries': []}
             
             logger.info(f"Recovered {position_type} position for {symbol} at entry price {entry_price}")
         
@@ -1226,7 +1953,7 @@ def update_momentum_stop_losses(exchange, update_all_positions=False, update_all
         if not open_positions:
             return
             
-        # logger.info(f"Updating entry-price-based reference stop levels for {len(open_positions)} open positions")
+        # logger.info(f"Updating entry-price-based reference stop levels for {len(open_positions)} openpositions")
         
         for symbol in open_positions:
             try:
@@ -1318,41 +2045,529 @@ def update_momentum_stop_losses(exchange, update_all_positions=False, update_all
                 
     except Exception as e:
         logger.exception(f"Error in update_momentum_stop_losses: {e}")
+
+# NEW: Function to check for and handle position exits
+# Updated check_for_position_exits with dynamic, market-adaptive thresholds
+def check_for_position_exits(exchange):
+    """
+    Check for position exits that mirror pyramid entry logic.
+    Reduces position at the same percentage levels used for pyramid entries.
+    NO time restrictions for scalping strategies.
+    """
+    try:
+        # Get open positions
+        open_positions = fetch_open_positions(exchange)
+        
+        if not open_positions:
+            return
+            
+        logger.info(f"Checking {len(open_positions)} open positions for exit conditions")
+        
+        for symbol in open_positions.keys():
+            try:
+                # Skip if not in our position tracking
+                with position_details_lock:
+                    if symbol not in position_details:
+                        continue
+                        
+                    position_info = position_details[symbol].copy()
+                
+                # Get position details
+                position_type = position_info.get('position_type')
+                entry_price = position_info.get('entry_price')
+                avg_entry_price = position_info.get('avg_entry_price', entry_price)
+                original_entry_price = position_info.get('original_entry_price', entry_price)
+                position_size = position_info.get('position_size', BASE_AMOUNT_USD)
+                leverage = position_info.get('leverage', 10)
+                
+                # Get pyramid details 
+                with pyramid_lock:
+                    pyramid_info = pyramid_details.get(symbol, {'count': 0, 'entries': []})
+                    pyramid_count = pyramid_info.get('count', 0)
+                    pyramid_entries = pyramid_info.get('entries', [])
+                
+                # Get current price
+                ticker = exchange.fetch_ticker(symbol)
+                current_price = ticker['last']
+                
+                # Get position quantity from exchange
+                pos_info = open_positions[symbol]
+                pos_amt = float(pos_info['info']['positionAmt'])
+                total_quantity = abs(pos_amt)
+                
+                # Get inverted side for exit orders
+                inverted_side = 'buy' if position_type == 'short' else 'sell'
+                
+                # =====================================================================
+                # PART 1: MIRROR PYRAMID LOGIC FOR POSITION REDUCTION
+                # =====================================================================
+                
+                # Only process if we have pyramid entries to potentially exit
+                if pyramid_count > 0 and len(pyramid_entries) > 0:
+                    try:
+                        # Get the most recent pyramid entry
+                        last_entry = pyramid_entries[-1]
+                        last_entry_price = last_entry.get('price', 0)
+                        last_entry_quantity = last_entry.get('quantity', 0)
+                        
+                        # Get the movement thresholds that were used for pyramiding
+                        # These are the same thresholds we'll use for exit, creating symmetry
+                        target_move_capture_pcts = PYRAMID_CONFIG['profit_thresholds']  # e.g., [15, 30, 45]
+                        
+                        # Get the indicator instance (needed for gain/decrease calculations)
+                        indicator = get_momentum_indicator(symbol, exchange)
+                        if indicator is None:
+                            logger.warning(f"Cannot check mirror exit for {symbol}: Failed to get momentum indicator")
+                            continue
+                            
+                        # Get historical data for gain/decrease calculation
+                        df_historical = fetch_extended_historical_data(exchange, symbol, MOMENTUM_TIMEFRAME)
+                        if df_historical is None or len(df_historical) < max(indicator.kama_period, 100):
+                            logger.warning(f"Insufficient historical data for {symbol} mirror exit check.")
+                            continue
+                        
+                        # Check for exit opportunity based on position type
+                        exit_triggered = False
+                        exit_level_index = -1
+                        
+                        if position_type == 'short':
+                            # For shorts: Check if price has moved back up toward high price
+                            # This mirrors the logic used in check_for_pyramid_opportunity but in reverse
+                            
+                            # Get gain info from indicator
+                            has_gain, gain_pct, low_price_gain, high_price, low_idx_gain, high_idx_gain = indicator.check_price_gain(df_historical)
+                            
+                            if has_gain and high_price is not None and high_price > 0:
+                                # Calculate how much price has recovered from the low (retraced the downmove)
+                                # For shorts, we exit if price retraces back upward
+                                current_recovery_pct = ((current_price - last_entry_price) / (high_price - last_entry_price)) * 100 if (high_price - last_entry_price) > 0 else 0
+                                
+                                # Check which pyramid threshold it has crossed
+                                for i, threshold_pct in enumerate(target_move_capture_pcts):
+                                    # Skip checking levels above our current pyramid count
+                                    if i >= pyramid_count:
+                                        break
+                                        
+                                    # For the most recent pyramid level (highest index), we're looking for ANY significant retrace
+                                    if i == pyramid_count - 1:
+                                        # For the most recent entry, use a fixed threshold
+                                        if current_recovery_pct >= 30:  # 30% retrace of the move
+                                            exit_triggered = True
+                                            exit_level_index = i
+                                            logger.info(f"SHORT MIRROR EXIT for {symbol}: Price recovered {current_recovery_pct:.2f}% "
+                                                      f"from last entry at {last_entry_price} toward high {high_price}")
+                                            break
+                                    # For earlier pyramid levels, we use the exact pyramid thresholds
+                                    elif current_recovery_pct >= threshold_pct:
+                                        exit_triggered = True
+                                        exit_level_index = i
+                                        logger.info(f"SHORT MIRROR EXIT for {symbol}: Price recovered {current_recovery_pct:.2f}% "
+                                                  f"matching pyramid threshold {threshold_pct}%")
+                                        break
+                            
+                        elif position_type == 'long':
+                            # For longs: Check if price has moved back down toward low price
+                            # This mirrors the logic used in check_for_pyramid_opportunity but in reverse
+                            
+                            # Get decrease info from indicator
+                            has_decrease, decrease_pct, high_price_dec, low_price, high_idx_dec, low_idx_dec = indicator.check_price_decrease(df_historical)
+                            
+                            if has_decrease and low_price is not None and low_price > 0:
+                                # Calculate how much price has retraced from the high (retraced the upmove)
+                                # For longs, we exit if price retraces back downward
+                                current_retrace_pct = ((last_entry_price - current_price) / (last_entry_price - low_price)) * 100 if (last_entry_price - low_price) > 0 else 0
+                                
+                                # Check which pyramid threshold it has crossed
+                                for i, threshold_pct in enumerate(target_move_capture_pcts):
+                                    # Skip checking levels above our current pyramid count
+                                    if i >= pyramid_count:
+                                        break
+                                        
+                                    # For the most recent pyramid level (highest index), we're looking for ANY significant retrace
+                                    if i == pyramid_count - 1:
+                                        # For the most recent entry, use a fixed threshold
+                                        if current_retrace_pct >= 30:  # 30% retrace of the move
+                                            exit_triggered = True
+                                            exit_level_index = i
+                                            logger.info(f"LONG MIRROR EXIT for {symbol}: Price retraced {current_retrace_pct:.2f}% "
+                                                      f"from last entry at {last_entry_price} toward low {low_price}")
+                                            break
+                                    # For earlier pyramid levels, we use the exact pyramid thresholds
+                                    elif current_retrace_pct >= threshold_pct:
+                                        exit_triggered = True
+                                        exit_level_index = i
+                                        logger.info(f"LONG MIRROR EXIT for {symbol}: Price retraced {current_retrace_pct:.2f}% "
+                                                  f"matching pyramid threshold {threshold_pct}%")
+                                        break
+                        
+                        # Execute the exit if triggered
+                        if exit_triggered and exit_level_index >= 0 and exit_level_index < len(pyramid_entries):
+                            # Get the entry we're exiting
+                            exit_entry = pyramid_entries[exit_level_index]
+                            exit_quantity = exit_entry.get('quantity', 0)
+                            
+                            if exit_quantity > 0:
+                                logger.info(f"Executing mirror exit for {symbol} at pyramid level {exit_level_index + 1}")
+                                
+                                # Limit the exit quantity to ensure it's not more than the total
+                                partial_exit_qty = min(exit_quantity, total_quantity * 0.9)
+                                
+                                # Close quantity equal to the pyramid entry
+                                partial_exit_order = place_order(
+                                    exchange,
+                                    symbol,
+                                    inverted_side,
+                                    partial_exit_qty,
+                                    current_price,
+                                    reduceOnly=True
+                                )
+                                
+                                if partial_exit_order:
+                                    logger.info(f"Successfully executed mirror exit for {symbol}: "
+                                              f"Closed {partial_exit_qty:.8f} of {total_quantity:.8f} total")
+                                    
+                                    # Update pyramid info - remove the exited level and all above it
+                                    with pyramid_lock:
+                                        if symbol in pyramid_details and pyramid_details[symbol]['count'] > 0:
+                                            # Remove the appropriate entries
+                                            pyramid_details[symbol]['entries'] = pyramid_details[symbol]['entries'][:exit_level_index]
+                                            pyramid_details[symbol]['count'] = len(pyramid_details[symbol]['entries'])
+                                            logger.info(f"Updated pyramid count for {symbol} to {pyramid_details[symbol]['count']}")
+                                    
+                                    # Update position details
+                                    with position_details_lock:
+                                        if symbol in position_details:
+                                            # Recalculate position size after exit
+                                            remaining_size = position_size
+                                            for i in range(exit_level_index, len(pyramid_entries)):
+                                                remaining_size -= pyramid_entries[i].get('added_size_usd', 0)
+                                            
+                                            position_details[symbol]['position_size'] = max(0, remaining_size)
+                                            logger.info(f"Updated position size for {symbol} to ${max(0, remaining_size):.2f}")
+                                            
+                                            # Reset to entry price before the exited pyramid levels
+                                            if exit_level_index == 0:
+                                                # If exiting first level, reset to original entry
+                                                position_details[symbol]['avg_entry_price'] = original_entry_price
+                                            else:
+                                                # Otherwise use the price from the previous level
+                                                prev_level_price = pyramid_entries[exit_level_index - 1].get('price', original_entry_price)
+                                                position_details[symbol]['avg_entry_price'] = prev_level_price
+                                    
+                                    # Skip other exit checks this cycle - we've already taken action
+                                    continue
+                                else:
+                                    logger.error(f"Failed to execute mirror exit order for {symbol}")
+                    
+                    except Exception as e:
+                        logger.exception(f"Error in mirror exit logic for {symbol}: {e}")
+                        # Continue to regular exit checks even if mirror exit fails
+                
+                # =====================================================================
+                # PART 2: REGULAR FULL EXIT LOGIC - Only if we get here
+                # =====================================================================
+                
+                try:
+                    # Get indicator for this symbol
+                    indicator = get_momentum_indicator(symbol, exchange)
+                    if not indicator:
+                        logger.warning(f"Cannot check exit for {symbol}: Failed to get momentum indicator")
+                        continue
+                        
+                    # Get historical data
+                    df = fetch_extended_historical_data(exchange, symbol, MOMENTUM_TIMEFRAME)
+                    if df is None or len(df) < 100:
+                        logger.warning(f"Insufficient data to check exit for {symbol}")
+                        continue
+                        
+                    # Update indicator with latest data
+                    indicator.update_price_data(df)
+                    
+                    # Calculate current profit percentage WITH LEVERAGE ADJUSTMENT
+                    current_profit_pct = calculate_position_profit(avg_entry_price, current_price, position_type, leverage)
+                    
+                    # Update max profit if applicable
+                    max_profit_pct = position_info.get('max_profit_pct', 0)
+                    if current_profit_pct > max_profit_pct:
+                        with position_details_lock:
+                            if symbol in position_details:
+                                position_details[symbol]['max_profit_pct'] = current_profit_pct
+                        max_profit_pct = current_profit_pct
+                    
+                    # Check for significant profit retracement
+                    profit_retracement = max_profit_pct - current_profit_pct
+                    retracement_ratio = profit_retracement / max_profit_pct if max_profit_pct > 0 else 0
+                    
+                    # Check for reversal signals and generate exit signal
+                    is_reversal, reversal_strength, reversal_reason = indicator.detect_reversal(df, position_type)
+                    stop_loss = position_info.get('stop_loss')
+                    exit_signal = indicator.generate_exit_signal(df, position_type, avg_entry_price, stop_loss)
+                    
+                    # Check exit conditions
+                    exit_triggered = False
+                    exit_reason = None
+                    should_reverse = False
+                    
+                    # 1. Check standard exit signal
+                    if exit_signal['exit_triggered']:
+                        exit_triggered = True
+                        exit_reason = exit_signal['reason']
+                        should_reverse = exit_signal.get('execute_reversal', False)
+                    
+                    # 2. Check profit retracement (with reduced threshold for pyramid positions)
+                    # More pyramids = stronger conviction = more aggressive profit protection
+                    elif max_profit_pct > 20:
+                        # Base threshold at 40%, but reduce for each pyramid level
+                        retracement_threshold = 0.4 - (0.05 * pyramid_count)  # 40%, 35%, 30%, 25%
+                        retracement_threshold = max(0.25, retracement_threshold)  # Don't go below 25%
+                        
+                        if retracement_ratio > retracement_threshold:
+                            exit_triggered = True
+                            exit_reason = f"Profit retracement: {profit_retracement:.1f}% ({retracement_ratio:.2f}) "
+                            exit_reason += f"from max {max_profit_pct:.1f}% [Threshold: {retracement_threshold:.2f}]"
+                            should_reverse = is_reversal and reversal_strength > 50
+                    
+                    # 3. Check strong reversal signal
+                    elif is_reversal and reversal_strength >= 70:
+                        exit_triggered = True
+                        exit_reason = f"Strong reversal signal detected ({reversal_strength}): {reversal_reason}"
+                        should_reverse = True
+                    
+                    # Process the exit if needed
+                    if exit_triggered:
+                        logger.info(f"EXIT SIGNAL for {symbol} {position_type.upper()}: {exit_reason}")
+                        
+                        # Close position
+                        exit_order = place_order(
+                            exchange, 
+                            symbol, 
+                            inverted_side, 
+                            total_quantity, 
+                            current_price, 
+                            reduceOnly=True
+                        )
+                        
+                        if exit_order:
+                            logger.info(f"Successfully exited {symbol} {position_type.upper()} position. "
+                                      f"Profit: {current_profit_pct:.2f}% [with {leverage}x leverage]")
+                            
+                            # Record trade result
+                            record_trade_result(
+                                symbol,
+                                avg_entry_price,
+                                current_price,
+                                position_type,
+                                position_info.get('entry_time'),
+                                leverage=leverage
+                            )
+                            
+                            # Handle reversal if applicable
+                            if should_reverse and ENABLE_AUTO_REVERSALS:
+                                logger.info(f"Attempting position reversal for {symbol} based on {exit_reason}")
+                                handle_position_reversal(
+                                    exchange,
+                                    symbol,
+                                    reversal_strength,
+                                    position_type,
+                                    current_profit_pct
+                                )
+                            else:
+                                # Clean up tracking
+                                with position_details_lock:
+                                    if symbol in position_details:
+                                        del position_details[symbol]
+                                        
+                                with pyramid_lock:
+                                    if symbol in pyramid_details:
+                                        del pyramid_details[symbol]
+                        else:
+                            logger.error(f"Failed to exit position for {symbol}")
+                            
+                except Exception as e:
+                    logger.exception(f"Error in regular exit checks for {symbol}: {e}")
+                    # Continue to next symbol
+            
+            except Exception as e:
+                logger.exception(f"Error checking exit for {symbol}: {e}")
+                continue
+    
+    except Exception as e:
+        logger.exception(f"Error in check_for_position_exits: {e}")
+# NEW: Function to check for pyramid opportunities
+def check_for_pyramid_entries(exchange):
+    """Check for pyramid entry opportunities in profitable positions with proper position size limits."""
+    try:
+        # Get open positions
+        open_positions = fetch_open_positions(exchange)
+
+        if not open_positions:
+            return
+
+        # logger.info(f"Checking {len(open_positions)} open positions for pyramid opportunities")
+
+        for symbol in open_positions.keys():
+            try:
+                # Check if we can pyramid this position using potentially modified logic
+                should_pyramid, size_to_add, reason = check_for_pyramid_opportunity(exchange, symbol)
+
+                if not should_pyramid:
+                    continue # Skip to next symbol
+
+                # Get position details needed for placing order
+                with position_details_lock:
+                    if symbol not in position_details:
+                        logger.warning(f"Position details disappeared for {symbol} during pyramid check")
+                        continue
+
+                    position_info = position_details[symbol].copy()
+
+                position_type = position_info.get('position_type')
+                leverage = position_info.get('leverage', 10) # Use stored or default leverage
+                current_total_size = position_info.get('position_size', BASE_AMOUNT_USD) # Get current total size before adding
+                entry_price = position_info.get('entry_price')
+
+                # FIXED: Double-check that adding won't exceed MAX_AMOUNT_USD
+                if current_total_size + size_to_add > MAX_AMOUNT_USD:
+                    logger.warning(f"Pyramid add for {symbol} would exceed MAX_AMOUNT_USD. "
+                                   f"Current: ${current_total_size:.2f}, Add: ${size_to_add:.2f}, Max: ${MAX_AMOUNT_USD:.2f}")
+                    
+                    # Calculate how much we can actually add (if any)
+                    allowable_add = max(0, MAX_AMOUNT_USD - current_total_size)
+                    if allowable_add < AMOUNT_INCREMENT / 2:
+                        logger.info(f"Skipping pyramid for {symbol}: only ${allowable_add:.2f} available to add (below minimum)")
+                        continue
+                    
+                    # Adjust size_to_add to stay within limits
+                    logger.info(f"Adjusting pyramid add size for {symbol} from ${size_to_add:.2f} to ${allowable_add:.2f}")
+                    size_to_add = allowable_add
+
+                # Determine entry side ('buy' for long, 'sell' for short)
+                entry_side = 'buy' if position_type == 'long' else 'sell'
+
+                # Get current price for order placement
+                current_price = exchange.fetch_ticker(symbol)['last']
+
+                # Calculate quantity based on the *size_to_add* returned by the check function
+                quantity = get_order_quantity(exchange, symbol, current_price, leverage, size_to_add) # Use size_to_add here
+
+                if quantity <= 0:
+                    logger.warning(f"Invalid quantity ({quantity}) calculated for {symbol} pyramid entry with add size {size_to_add:.2f} USD.")
+                    continue
+
+                # Log pyramid details before placing order
+                logger.info(f"ADDING PYRAMID POSITION for {symbol} {position_type.upper()}: {reason}")
+                logger.info(f"Current position size: ${current_total_size:.2f}, Adding: ${size_to_add:.2f} (Qty: {quantity:.8f})")
+
+                # Place the pyramid order (adds to the existing position)
+                pyramid_order = place_order(
+                    exchange,
+                    symbol,
+                    entry_side,
+                    quantity,
+                    current_price, # Market order, price is indicative
+                    leverage=leverage
+                    # reduceOnly should NOT be True for adding to a position
+                )
+
+                if pyramid_order:
+                    # Use executed price if available, otherwise market price estimate
+                    executed_price = pyramid_order.get('average', current_price) if pyramid_order.get('average') else current_price
+                    logger.info(f"Successfully submitted pyramid add order for {symbol} at ~{executed_price:.6f}")
+
+                    # Update pyramid tracking count and entry details
+                    with pyramid_lock:
+                        if symbol not in pyramid_details:
+                            pyramid_details[symbol] = {'count': 0, 'entries': []}
+
+                        # Add the new entry info
+                        pyramid_details[symbol]['count'] += 1
+                        pyramid_details[symbol]['entries'].append({
+                            'price': executed_price,
+                            'added_size_usd': size_to_add, # Store the USD size added
+                            'quantity': quantity,       # Store quantity added
+                            'time': time.time()
+                        })
+                        new_pyramid_count = pyramid_details[symbol]['count']
+                        
+                        # Get all pyramid entries for weighted average calculation
+                        pyramid_entries = pyramid_details[symbol]['entries']
+
+                    # Calculate weighted average entry price
+                    # Get position details from exchange for accurate total size
+                    total_quantity = abs(float(open_positions[symbol]['info']['positionAmt']))
+                    
+                    # Initialize calculation variables
+                    weighted_sum = entry_price * (total_quantity - quantity)  # Original position value
+                    weighted_sum += executed_price * quantity  # New position value
+                    
+                    # Calculate weighted average
+                    avg_entry_price = weighted_sum / total_quantity if total_quantity > 0 else entry_price
+                    
+                    # Update the total position size in position tracking
+                    with position_details_lock:
+                        if symbol in position_details:
+                            # Update size by adding the actual size added
+                            new_total_size = current_total_size + size_to_add
+                            position_details[symbol]['position_size'] = new_total_size
+                            # Save average entry price
+                            position_details[symbol]['avg_entry_price'] = avg_entry_price
+                            # Keep original entry for reference
+                            if 'original_entry_price' not in position_details[symbol]:
+                                position_details[symbol]['original_entry_price'] = entry_price
+                                
+                            logger.info(f"Updated position size for {symbol} to ${new_total_size:.2f} (Pyramid Level: {new_pyramid_count})")
+                            logger.info(f"Updated average entry price for {symbol} to {avg_entry_price:.6f} (Original: {entry_price:.6f})")
+
+                else:
+                    logger.error(f"Failed to place pyramid add order for {symbol}")
+
+            except Exception as e:
+                logger.exception(f"Error checking/placing pyramid entry for {symbol}: {e}")
+                continue # Continue to the next symbol
+
+    except Exception as e:
+        logger.exception(f"Error in check_for_pyramid_entries main loop: {e}")
+
 def momentum_trading_loop(exchange):
     """
-    Momentum trading loop using extended historical data.
-    Handles short trading opportunities.
-    Uses pre-generated signals to avoid redundant calculations.
+    Enhanced momentum trading loop with position sizing, pyramiding, and reversal handling.
+    Handles both short and long trading opportunities.
     """
     while True:
         try:
-            # Check for position exits and handle existing positions
-            open_positions = fetch_open_positions(exchange)
-            
-            # Synchronize local position tracking with exchange positions
-            # This will automatically clean up any positions that were closed by SL/TP orders
+            # Sync positions with exchange first
             sync_positions_with_exchange(exchange)
             
+            # Check for position exits including reversals
+            check_for_position_exits(exchange)
+            
+            # Check for pyramid opportunities
+            check_for_pyramid_entries(exchange)
+            
+            # Check current positions after the above operations
+            open_positions = fetch_open_positions(exchange)
+            
             # Check if we can look for new entries
-            open_positions = fetch_open_positions(exchange)  # Refresh after sync
             if len(open_positions) >= MAX_OPEN_TRADES:
-                # logger.info(f"At maximum number of open trades ({len(open_positions)}/{MAX_OPEN_TRADES}). Skipping new entries.")
+                logger.info(f"At maximum number of open trades ({len(open_positions)}/{MAX_OPEN_TRADES}). Skipping new entries.")
                 time.sleep(SLEEP_INTERVAL * 3)
                 continue  # Skip to next loop iteration, don't look for new entries
             
-            # Find coins with significant price movements (only gainers)
-            momentum_candidates = find_momentum_candidates(exchange, sort_type='gainers', limit=20)
+            # Find coins with significant price movements (both gainers and losers)
+            momentum_candidates = find_momentum_candidates(exchange, sort_type='both', limit=20)
             
             # Extract short candidates
             if isinstance(momentum_candidates, tuple):
                 # Handle the case where find_momentum_candidates returns a tuple
                 short_candidates, stored_signals = momentum_candidates
+                long_candidates = []  # No long candidates in this format
             else:
                 # Handle the case where it returns a dictionary 
                 short_candidates = momentum_candidates['short']['sorted_symbols']
                 stored_signals = momentum_candidates['short']['signals']
+                long_candidates = []  # No specific long candidates yet
             
-            logger.info(f"Checking {len(short_candidates)} momentum short candidates for entry signals...")
+            logger.info(f"Checking {len(short_candidates)} momentum candidates for entry signals...")
             
             entry_placed = False  # Flag to track if we've placed an entry
             
@@ -1392,12 +2607,15 @@ def momentum_trading_loop(exchange):
                         
                         logger.info(f"MOMENTUM SHORT SIGNAL: {symbol} - {signal['reason']}")
                         
+                        # Calculate position size based on performance history
+                        position_size = calculate_position_size(symbol)
+                        
                         leverage = get_leverage_for_market(exchange, symbol)
                         if not leverage:
                             logger.error(f"Failed to set leverage for {symbol}. Skipping.")
                             continue
                             
-                        quantity = get_order_quantity(exchange, symbol, current_price, leverage)
+                        quantity = get_order_quantity(exchange, symbol, current_price, leverage, position_size)
                         
                         if quantity <= 0:
                             logger.warning(f"Invalid quantity calculated for {symbol}. Skipping.")
@@ -1406,10 +2624,10 @@ def momentum_trading_loop(exchange):
                         current_kama = signal.get('kama_value')
                         
                         # Calculate fixed SL and TP based on entry price and leverage
-                        # For short, SL is 60% loss of position value
-                        stop_loss = current_price * (1 + 0.6/leverage)
-                        # Target is 100% gain
-                        target_price = current_price * (1 - 1/leverage)
+                        # For short, SL is 6% price move divided by leverage (60% position value with 10x)
+                        stop_loss = current_price * (1 + 0.06/leverage)
+                        # Target is 10% price move divided by leverage (100% position value with 10x)
+                        target_price = current_price * (1 - 0.1/leverage)
                             
                         with position_details_lock:
                             position_details[symbol] = {
@@ -1427,10 +2645,17 @@ def momentum_trading_loop(exchange):
                                 'kama_value': current_kama,
                                 'crossunder_age': crossunder_age,
                                 'crossunder_minutes_ago': minutes_ago,
-                                'leverage': leverage
+                                'leverage': leverage,
+                                'position_size': position_size,
+                                'max_profit_pct': 0
                             }
                             
+                        # Initialize pyramid tracking
+                        with pyramid_lock:
+                            pyramid_details[symbol] = {'count': 0, 'entries': []}
+                            
                         logger.info(f"Placing momentum short for {symbol} at {current_price} "
+                                 f"with position size ${position_size} and {leverage}x leverage "
                                  f"(crossunder was {crossunder_age} candles / {minutes_ago} minutes ago)")
                         
                         order = place_order(
@@ -1445,22 +2670,21 @@ def momentum_trading_loop(exchange):
                                 if symbol in position_details:
                                     position_details[symbol]['entry_price'] = executed_price
                                     # Update SL and TP with executed price
-                                    position_details[symbol]['stop_loss'] = executed_price * (1 + 0.6/leverage)
-                                    position_details[symbol]['target'] = executed_price * (1 - 1/leverage)
+                                    position_details[symbol]['stop_loss'] = executed_price * (1 + 0.06/leverage)
+                                    position_details[symbol]['target'] = executed_price * (1 - 0.1/leverage)
                                     stop_loss = position_details[symbol]['stop_loss']
                                     target_price = position_details[symbol]['target']
                             
-                            logger.info(f"Position opened for {symbol} with fixed SL at {stop_loss} and TP at {target_price}")
+                            logger.info(f"Position opened for {symbol} with TP at {target_price} (10% price move / ~100% profit with {leverage}x leverage)")
                             
-                            # Place SL and TP orders
-                            # place_sl_tp_orders(
-                            #     exchange, 
-                            #     symbol, 
-                            #     'sell',  # Entry side was sell for short
-                            #     quantity, 
-                            #     stop_loss, 
-                            #     target_price
-                            # )
+                            # Place only TP order (not SL since we use dynamic management)
+                            place_tp_only_order(
+                                exchange, 
+                                symbol, 
+                                'sell',  # Entry side was sell for short
+                                quantity, 
+                                leverage
+                            )
                             
                             entry_placed = True
                             
@@ -1475,9 +2699,103 @@ def momentum_trading_loop(exchange):
                             with position_details_lock:
                                 if symbol in position_details:
                                     del position_details[symbol]
+                                    
+                            with pyramid_lock:
+                                if symbol in pyramid_details:
+                                    del pyramid_details[symbol]
                 
                 except Exception as e:
                     logger.exception(f"Error processing momentum short for {symbol}: {e}")
+            
+            # Process long candidates if we still have room for trades
+            if not entry_placed and len(open_positions) < MAX_OPEN_TRADES:
+                # For now, we'll check for long signals in the stored signals
+                long_signals = {s: sig for s, sig in stored_signals.items() 
+                               if sig['signal'] == 'buy' and s not in open_positions}
+                
+                if long_signals:
+                    logger.info(f"Found {len(long_signals)} potential long entries to process")
+                    
+                    for symbol, signal in long_signals.items():
+                        try:
+                            current_price = signal['price']
+                            position_size = calculate_position_size(symbol)
+                            
+                            leverage = get_leverage_for_market(exchange, symbol)
+                            if not leverage:
+                                continue
+                                
+                            quantity = get_order_quantity(exchange, symbol, current_price, leverage, position_size)
+                            if quantity <= 0:
+                                continue
+                                
+                            stop_loss = signal['stop_loss']
+                            # Target is 10% price move with leverage (100% profit with 10x leverage)
+                            target_price = current_price * (1 + 0.1/leverage)
+                            
+                            logger.info(f"MOMENTUM LONG SIGNAL: {symbol} - {signal['reason']}")
+                            
+                            with position_details_lock:
+                                position_details[symbol] = {
+                                    'entry_price': current_price,
+                                    'stop_loss': stop_loss,
+                                    'target': target_price,
+                                    'position_type': 'long',
+                                    'entry_reason': f"Momentum Long: {signal['reason']}",
+                                    'probability': signal.get('probability', 0.7),
+                                    'entry_time': time.time(),
+                                    'highest_reached': current_price,
+                                    'lowest_reached': None,
+                                    'signal_type': 'momentum_long',
+                                    'signal_strength': 70,
+                                    'leverage': leverage,
+                                    'position_size': position_size,
+                                    'max_profit_pct': 0
+                                }
+                                
+                            # Initialize pyramid tracking
+                            with pyramid_lock:
+                                pyramid_details[symbol] = {'count': 0, 'entries': []}
+                                
+                            order = place_order(
+                                exchange, symbol, 'buy', quantity, current_price, leverage=leverage
+                            )
+                            
+                            if order:
+                                logger.info(f"Opened MOMENTUM LONG position for {symbol}")
+                                
+                                executed_price = order.get('average', current_price)
+                                with position_details_lock:
+                                    if symbol in position_details:
+                                        position_details[symbol]['entry_price'] = executed_price
+                                        # Update SL with executed price
+                                        position_details[symbol]['stop_loss'] = executed_price * (1 - 0.06/leverage)
+                                        position_details[symbol]['target'] = executed_price * (1 + 0.1/leverage)
+                                        stop_loss = position_details[symbol]['stop_loss']
+                                        target_price = position_details[symbol]['target']
+                                
+                                # Place only TP order for this position
+                                place_tp_only_order(
+                                    exchange, 
+                                    symbol, 
+                                    'buy',  # Entry side was buy for long
+                                    quantity, 
+                                    leverage
+                                )
+                                
+                                entry_placed = True
+                                break
+                            else:
+                                logger.error(f"Failed to open momentum long for {symbol}")
+                                with position_details_lock:
+                                    if symbol in position_details:
+                                        del position_details[symbol]
+                                with pyramid_lock:
+                                    if symbol in pyramid_details:
+                                        del pyramid_details[symbol]
+                                        
+                        except Exception as e:
+                            logger.exception(f"Error processing momentum long for {symbol}: {e}")
             
             if not entry_placed:
                 logger.info("No suitable momentum candidates found for entry")
@@ -1490,18 +2808,20 @@ def momentum_trading_loop(exchange):
             time.sleep(SLEEP_INTERVAL * 5)
 
 def main():
-    """Main function to start the trading bot."""
+    """Main function to start the trading bot with enhanced features."""
     exchange = create_exchange()
-    # Update configuration constants - MINIMUM_HOLD_MINUTES is all we need
+    
+    # Update configuration constants for minimum hold time
     global MINIMUM_HOLD_MINUTES
     MINIMUM_HOLD_MINUTES = 2  # Minimum 2 minutes hold time
+    
     # Recovery mode - check for any missed exits
     sync_positions_with_exchange(exchange)
     
-    # Start the momentum short strategy loop in a separate thread
+    # Start the momentum trading loop in a separate thread
     momentum_thread = threading.Thread(target=momentum_trading_loop, args=(exchange,), daemon=True)
     momentum_thread.start()
-    logger.info("Started momentum short trading thread")
+    logger.info("Started enhanced momentum trading thread with dynamic position sizing and pyramiding")
     
     # Keep the main thread alive
     while True:

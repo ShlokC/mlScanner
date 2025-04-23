@@ -631,6 +631,114 @@ class MomentumShortIndicator:
         
         # Direction 1 means bullish (green)
         return current_direction == 1
+
+    # NEW METHOD: Detect reversal signals    
+    def detect_reversal(self, df, position_type):
+        """
+        Detect if market is showing signs of reversal against current position
+        
+        Args:
+            df: DataFrame with OHLC data including indicators
+            position_type: 'long' or 'short' - current position direction
+            
+        Returns:
+            tuple: (is_reversal, reversal_strength, reversal_reason)
+                is_reversal: Boolean indicating if a reversal is detected
+                reversal_strength: 0-100 score indicating strength of reversal signal
+                reversal_reason: String explanation of the reversal signal
+        """
+        # Initialize
+        is_reversal = False
+        reversal_strength = 0  # 0-100 scale
+        reversal_reason = ""
+        
+        try:
+            # Ensure we have enough data
+            if df is None or len(df) < max(self.kama_period, self.supertrend_length + 5):
+                return False, 0, "Insufficient data for reversal detection"
+                
+            # Check for kama cross events based on position type
+            if position_type == 'short':
+                # For shorts, check for price crossing above kama (bullish reversal)
+                has_crossover, crossover_age, minutes_ago, is_first = self.check_kama_crossover(df)
+                is_supertrend_bullish = self.check_supertrend_bullish(df)
+                
+                # Calculate reversal strength - base score from crossover
+                if has_crossover:
+                    # Base score for crossover - more recent crossovers are stronger
+                    reversal_strength += max(0, 40 - crossover_age)
+                    
+                    if is_supertrend_bullish:
+                        reversal_strength += 30  # Supertrend confirms reversal
+                        reversal_reason = f"Price crossed above kama({self.kama_period}) {minutes_ago} minutes ago with bullish supertrend"
+                    else:
+                        reversal_reason = f"Price crossed above kama({self.kama_period}) {minutes_ago} minutes ago"
+                    
+                    # Check recent candle momentum (last 3 candles)
+                    if len(df) >= 3:
+                        recent_candles = df.iloc[-3:]
+                        bullish_candles = sum(1 for i in range(len(recent_candles)) 
+                                            if recent_candles['close'].iloc[i] > recent_candles['open'].iloc[i])
+                        
+                        if bullish_candles >= 2:
+                            reversal_strength += 15  # Mostly bullish recent candles
+                            reversal_reason += " with bullish momentum"
+                    
+                    # Check volume trend
+                    if 'volume' in df.columns and len(df) >= 6:
+                        vol_last3 = df['volume'].iloc[-3:].mean()
+                        vol_prev3 = df['volume'].iloc[-6:-3].mean()
+                        
+                        if vol_last3 > vol_prev3 * 1.5:
+                            reversal_strength += 15  # Increasing volume supports reversal
+                            reversal_reason += " on increasing volume"
+                
+                # Consider this a reversal if strength is high enough
+                is_reversal = reversal_strength >= 60
+                
+            elif position_type == 'long':
+                # For longs, check for price crossing below kama (bearish reversal)
+                has_crossunder, crossunder_age, minutes_ago, is_first = self.check_kama_crossunder(df)
+                is_supertrend_bearish = self.check_supertrend_bearish(df)
+                
+                # Calculate reversal strength - base score from crossunder
+                if has_crossunder:
+                    # Base score for crossunder - more recent crossunders are stronger
+                    reversal_strength += max(0, 40 - crossunder_age)
+                    
+                    if is_supertrend_bearish:
+                        reversal_strength += 30  # Supertrend confirms reversal
+                        reversal_reason = f"Price crossed below kama({self.kama_period}) {minutes_ago} minutes ago with bearish supertrend"
+                    else:
+                        reversal_reason = f"Price crossed below kama({self.kama_period}) {minutes_ago} minutes ago"
+                    
+                    # Check recent candle momentum (last 3 candles)
+                    if len(df) >= 3:
+                        recent_candles = df.iloc[-3:]
+                        bearish_candles = sum(1 for i in range(len(recent_candles)) 
+                                            if recent_candles['close'].iloc[i] < recent_candles['open'].iloc[i])
+                        
+                        if bearish_candles >= 2:
+                            reversal_strength += 15  # Mostly bearish recent candles
+                            reversal_reason += " with bearish momentum"
+                    
+                    # Check volume trend
+                    if 'volume' in df.columns and len(df) >= 6:
+                        vol_last3 = df['volume'].iloc[-3:].mean()
+                        vol_prev3 = df['volume'].iloc[-6:-3].mean()
+                        
+                        if vol_last3 > vol_prev3 * 1.5:
+                            reversal_strength += 15  # Increasing volume supports reversal
+                            reversal_reason += " on increasing volume"
+                
+                # Consider this a reversal if strength is high enough
+                is_reversal = reversal_strength >= 60
+            
+            return is_reversal, reversal_strength, reversal_reason
+            
+        except Exception as e:
+            logger.error(f"{self.symbol}: Error in detect_reversal: {e}")
+            return False, 0, f"Error detecting reversal: {e}"
     
     def determine_stop_loss(self, df, position_type='short', entry_price=None):
         """
@@ -737,6 +845,18 @@ class MomentumShortIndicator:
                 'exit_triggered': False
             }
             
+            # NEW: Check for reversal signals
+            is_reversal, reversal_strength, reversal_reason = self.detect_reversal(df, current_position)
+            
+            # If we have a strong reversal signal, exit the position
+            if is_reversal and reversal_strength >= 70:
+                exit_signal['signal'] = f'exit_{current_position}'
+                exit_signal['exit_triggered'] = True
+                exit_signal['reason'] = f'Strong reversal detected: {reversal_reason}' 
+                exit_signal['reversal_strength'] = reversal_strength
+                exit_signal['execute_reversal'] = True  # Signal to execute reversal after exit
+                return exit_signal
+            
             # Check for exit conditions based on price movement from entry
             if current_position == 'short':
                 # Calculate percentage change from entry price
@@ -755,7 +875,9 @@ class MomentumShortIndicator:
                         exit_signal['signal'] = 'exit_short'
                         exit_signal['exit_triggered'] = True
                         exit_signal['reason'] = f'Price {current_price} is {price_change_pct:.2f}% above entry price {entry_price} (threshold: {short_exit_pct}%)'
-                        exit_signal['execute_reversal'] = True  # Signal to execute reversal (short to long)
+                        
+                        # If also seeing reversal signals, suggest reversal
+                        exit_signal['execute_reversal'] = (is_reversal and reversal_strength >= 50)
                 
                 # Make sure stop loss is valid (above entry price for shorts)
                 if stop_loss is not None and stop_loss <= entry_price:
@@ -790,7 +912,9 @@ class MomentumShortIndicator:
                         exit_signal['signal'] = 'exit_long'
                         exit_signal['exit_triggered'] = True
                         exit_signal['reason'] = f'Price {current_price} is {price_change_pct:.2f}% below entry price {entry_price} (threshold: {long_exit_pct}%)'
-                        exit_signal['execute_reversal'] = True  # Signal to execute reversal (long to short)
+                        
+                        # If also seeing reversal signals, suggest reversal
+                        exit_signal['execute_reversal'] = (is_reversal and reversal_strength >= 50)
                 
                 # Make sure stop loss is valid (below entry price for longs)
                 if stop_loss is not None and stop_loss >= entry_price:
@@ -913,7 +1037,7 @@ class MomentumShortIndicator:
                 'kama_crossunder_met': has_kama_crossunder,
                 'is_first_crossunder': is_first_crossunder,  # Still track this but don't require it
                 'is_recent_crossunder': is_recent_crossunder,
-                'crossunder_age_candles': crossunder_age,
+                'crossunder_age': crossunder_age,
                 'crossunder_minutes_ago': minutes_ago_crossunder,
                 'is_below_kama': is_below_kama,
                 'supertrend_bearish_met': True
@@ -941,7 +1065,7 @@ class MomentumShortIndicator:
                 'kama_crossover_met': has_kama_crossover,
                 'is_first_crossover': is_first_crossover,  # Still track this but don't require it
                 'is_recent_crossover': is_recent_crossover,
-                'crossover_age_candles': crossover_age,
+                'crossover_age': crossover_age,
                 'crossover_minutes_ago': minutes_ago_crossover,
                 'is_above_kama': is_above_kama,
                 'supertrend_bullish_met': True
@@ -1016,6 +1140,64 @@ class MomentumShortIndicator:
                 logger.info(f"VALID SHORT SIGNAL for {self.symbol}: Crossunder within last 6 candles, "
                         f"on candle {crossunder_age}, {minutes_ago_crossunder} minutes ago, drawdown: {drawdown_pct:.2f}%, "
                         f"Entry: {current_price}, SL: {stop_loss} ({self.sl_buffer_pct}% above entry)")
+                
+                return signal
+            
+            # ENHANCEMENT: Generate LONG signal as well
+            if (has_price_decrease and has_kama_crossover and is_recent_crossover 
+                and is_above_kama and is_supertrend_bullish):
+                
+                recovery_pct = long_conditions_met.get('recovery_pct', 0)
+                
+                # Similar check for long - skip if already recovered too much
+                if recovery_pct > decrease_pct * 0.7:  # If recovered more than 70% of the decrease
+                    logger.info(f"Skipping LONG signal for {self.symbol}: Price already recovered {recovery_pct:.2f}% from its {decrease_pct:.2f}% drop")
+                    return {
+                        'signal': 'none',
+                        'reason': f'price_already_recovered_too_much',
+                        'price': current_price,
+                        'stop_loss': None,
+                        'short_conditions_met': short_conditions_met,
+                        'long_conditions_met': long_conditions_met,
+                        'exit_triggered': False,
+                        'kama_value': current_kama
+                    }
+                
+                stop_loss = self.determine_stop_loss(df, position_type='long', entry_price=current_price)
+                
+                if stop_loss is None or stop_loss <= 0:
+                    return {
+                        'signal': 'none',
+                        'reason': 'invalid_stop_loss',
+                        'price': current_price,
+                        'stop_loss': None,
+                        'short_conditions_met': short_conditions_met,
+                        'long_conditions_met': long_conditions_met,
+                        'exit_triggered': False
+                    }
+                
+                # Generate buy signal
+                signal = {
+                    'signal': 'buy',
+                    'reason': f"Dropped {decrease_pct:.2f}% recently and now {recovery_pct:.2f}% up from low, "
+                            f"Crossover above kama({self.kama_period}) within last 6 candles (age: {crossover_age}), "
+                            f"supertrend bullish",
+                    'price': current_price,
+                    'stop_loss': stop_loss,
+                    'short_conditions_met': short_conditions_met,
+                    'long_conditions_met': long_conditions_met,
+                    'has_kama_crossover': has_kama_crossover,
+                    'is_first_crossover': is_first_crossover,
+                    'is_recent_crossover': is_recent_crossover,
+                    'crossover_age': crossover_age,
+                    'crossover_minutes_ago': minutes_ago_crossover,
+                    'exit_triggered': False,
+                    'kama_value': current_kama
+                }
+                
+                logger.info(f"VALID LONG SIGNAL for {self.symbol}: Crossover within last 6 candles, "
+                        f"on candle {crossover_age}, {minutes_ago_crossover} minutes ago, recovery: {recovery_pct:.2f}%, "
+                        f"Entry: {current_price}, SL: {stop_loss} ({self.sl_buffer_pct}% below entry)")
                 
                 return signal
             
