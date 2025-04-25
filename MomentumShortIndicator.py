@@ -355,7 +355,7 @@ class MomentumShortIndicator:
                 len(valid_crossunders) > 1 and 
                 first_idx - valid_crossunders[-2][1] >= min_candles_between_crossunders * 2
             )
-            
+            is_first_crossunder = True
             # Calculate candle age and time
             crossunder_candle_age = len(df_valid) - 1 - first_idx
             
@@ -1026,7 +1026,7 @@ class MomentumShortIndicator:
             is_supertrend_bearish = self.check_supertrend_bearish(df, supertrend_data)
             
             # *** Check for crossunder on current or previous 6 candles ***
-            is_recent_crossunder = crossunder_age <= 144  # 0-6 = current or up to 6 candles ago
+            is_recent_crossunder = crossunder_age <= 3  # 0-6 = current or up to 6 candles ago
             
             # All conditions for a sell (short) signal
             short_conditions_met = {
