@@ -687,9 +687,8 @@ def check_for_pyramid_entries(exchange):
 
 def check_for_position_exits(exchange):
     """
-    Check for position exits using only exchange data as the source of truth.
-    UPDATED: Added condition to exit short positions if open price is above KAMA.
-    UPDATED: Enforces 5-minute minimum hold period before any exit.
+    Check for position exits using hybrid approach combining KAMA trend and price action.
+    Protects against large adverse price movements within candles.
     """
     try:
         # Get open positions directly from exchange
@@ -771,9 +770,11 @@ def check_for_position_exits(exchange):
                     exit_reason = signal.get('reason', "")
                     should_reverse = signal.get('execute_reversal', False)
                     
-                    # NEW: Check if open price is above KAMA (for short positions)
+                    # HYBRID APPROACH: Combine KAMA trend with price action safeguards
                     kama_value = None
                     is_open_above_kama = False
+                    is_high_above_kama = False
+                    is_volatile_candle = False
                     
                     # Get KAMA value
                     kama_columns = [col for col in df.columns if col.startswith('kama_')]
@@ -781,19 +782,76 @@ def check_for_position_exits(exchange):
                         kama_column = kama_columns[0]
                         kama_value = df[kama_column].iloc[-1]
                         
-                        # Get current candle open price
-                        current_open = df['open'].iloc[-1] if len(df) > 0 else None
-                        
-                        # Check if open is above KAMA
-                        if current_open is not None and kama_value is not None:
-                            percent_above_kama = ((current_open - kama_value) / kama_value) * 100
-                            is_open_above_kama = percent_above_kama >= 2.0
+                        if kama_value is not None and len(df) > 0:
+                            # Get current candle data
+                            current_open = df['open'].iloc[-1]
+                            current_high = df['high'].iloc[-1]
+                            current_low = df['low'].iloc[-1]
+                            current_close = df['close'].iloc[-1]
                             
-                        # For short positions, exit if open is above KAMA (trend reversal signal)
-                        if position_type == 'short' and is_open_above_kama:
-                            exit_triggered = True
-                            exit_reason = f"SHORT exit: Open price ({current_open:.6f}) is {percent_above_kama:.2f}% above KAMA ({kama_value:.6f}), exceeding 2% threshold"
-                            logger.info(f"KAMA-based exit triggered for {symbol}: {exit_reason}")
+                            # Calculate percentage differences
+                            exit_gap_percent = ((current_open - kama_value) / kama_value) * 100
+                            high_gap_percent = ((current_high - kama_value) / kama_value) * 100
+                            
+                            # Calculate candle volatility
+                            candle_range = current_high - current_low
+                            volatility_percent = (candle_range / current_low) * 100
+                            
+                            # Check conditions
+                            is_open_above_kama = exit_gap_percent >= 1.0  # Original condition
+                            is_high_above_kama = high_gap_percent >= 2.5  # New: high is significantly above KAMA
+                            is_volatile_candle = volatility_percent >= 3.0  # New: candle shows high volatility
+                            
+                            # For short positions, implement hybrid exit strategy
+                            if position_type == 'short':
+                                # Exit if open is above KAMA (original condition)
+                                if is_open_above_kama:
+                                    exit_triggered = True
+                                    exit_reason = f"SHORT exit: Open price ({current_open:.6f}) is {exit_gap_percent:.2f}% above KAMA ({kama_value:.6f})"
+                                
+                                # OR exit if high is significantly above KAMA even if open wasn't
+                                elif is_high_above_kama:
+                                    exit_triggered = True
+                                    exit_reason = f"SHORT exit: High price ({current_high:.6f}) reached {high_gap_percent:.2f}% above KAMA ({kama_value:.6f})"
+                                
+                                # OR exit if candle shows extreme volatility (potential large adverse move)
+                                elif is_volatile_candle and current_close > current_open:
+                                    exit_triggered = True 
+                                    exit_reason = f"SHORT exit: Volatile candle detected ({volatility_percent:.2f}% range) with bullish close"
+                                
+                                # Log detailed analysis even if not exiting
+                                if not exit_triggered and (is_high_above_kama or is_volatile_candle):
+                                    logger.info(f"CAUTION for {symbol}: High nearly breached KAMA ({high_gap_percent:.2f}%) " 
+                                              f"with {volatility_percent:.2f}% candle volatility")
+                            
+                            # For long positions, implement mirror hybrid exit strategy  
+                            elif position_type == 'long':
+                                # Calculate downside gaps
+                                low_gap_percent = ((kama_value - current_low) / kama_value) * 100
+                                open_below_gap = ((kama_value - current_open) / kama_value) * 100
+                                
+                                # Exit if open is below KAMA by threshold
+                                is_open_below_kama = open_below_gap >= 1.0
+                                is_low_below_kama = low_gap_percent >= 2.5
+                                
+                                if is_open_below_kama:
+                                    exit_triggered = True
+                                    exit_reason = f"LONG exit: Open price ({current_open:.6f}) is {open_below_gap:.2f}% below KAMA ({kama_value:.6f})"
+                                
+                                # OR exit if low is significantly below KAMA
+                                elif is_low_below_kama:
+                                    exit_triggered = True
+                                    exit_reason = f"LONG exit: Low price ({current_low:.6f}) reached {low_gap_percent:.2f}% below KAMA ({kama_value:.6f})"
+                                
+                                # OR exit if candle shows extreme volatility with bearish close
+                                elif is_volatile_candle and current_close < current_open:
+                                    exit_triggered = True
+                                    exit_reason = f"LONG exit: Volatile candle detected ({volatility_percent:.2f}% range) with bearish close"
+                                
+                                # Log detailed analysis even if not exiting
+                                if not exit_triggered and (is_low_below_kama or is_volatile_candle):
+                                    logger.info(f"CAUTION for {symbol}: Low nearly breached KAMA ({low_gap_percent:.2f}%) " 
+                                              f"with {volatility_percent:.2f}% candle volatility")
                     
                     # If signal doesn't contain exit info, check additional conditions
                     if not exit_triggered:
