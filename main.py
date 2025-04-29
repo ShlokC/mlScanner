@@ -13,7 +13,8 @@ from MomentumShortIndicator import MomentumShortIndicator, create_momentum_short
 
 # Configuration
 SLEEP_INTERVAL = 1  # seconds
-MAX_OPEN_TRADES = 5  # Maximum number of open trades at any time
+ENABLE_HEDGE_MODE = True
+MAX_OPEN_TRADES = 2  # Maximum number of open trades at any time
 BASE_AMOUNT_USD = 1 # Starting position size
 MAX_AMOUNT_USD = 3.0  # Maximum position size
 AMOUNT_INCREMENT = 1  # Position size increments
@@ -58,7 +59,15 @@ global_metrics = {
     'successful_entries': 0,
     'last_reset': time.time()
 }
-
+# Configuration for hybrid exit strategy
+HYBRID_EXIT_CONFIG = {
+    'open_kama_threshold': 1.0,      # Exit when open is 1% above/below KAMA
+    'extreme_kama_threshold': 2,    # Exit when high/low is 2.5% beyond KAMA
+    'volatility_threshold': 3.0,      # Exit on candles with 3%+ range
+    'enable_hybrid_exits': True,      # Master switch to enable/disable hybrid exits
+    'enable_volatility_exits': True,  # Enable exits based on candle volatility
+    'log_near_threshold_warnings': True  # Log warnings for near-threshold conditions
+}
 # Logger setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -227,9 +236,9 @@ def fetch_extended_historical_data(exchange, symbol, timeframe=MOMENTUM_TIMEFRAM
             if kama_result is not None and not kama_result.empty:
                 df_combined[f"kama_{kama_period}"] = kama_result
             else:
-                logger.warning(f"Failed to calculate kama for {symbol} - got empty result")
+                logger.info(f"Failed to calculate kama for {symbol} - got empty result")
                 # Fallback: calculate kama using pandas
-                df_combined[f"kama_{kama_period}"] = df_combined['close'].ewm(span=kama_period, adjust=False).mean()
+                # df_combined[f"kama_{kama_period}"] = df_combined['close'].ewm(span=kama_period, adjust=False).mean()
         
             # 2. Supertrend
             supertrend_length = 7
@@ -377,132 +386,164 @@ def fetch_binance_data(exchange, market_id, timeframe=TIMEFRAME, limit=LIMIT, in
 def fetch_open_positions(exchange):
     """
     Enhanced fetch_open_positions that extracts all relevant position data from the exchange.
-    Properly calculates fixed 6% SL and 20% TP based on price change only, regardless of leverage.
+    Improved to properly handle hedge mode positions (LONG and SHORT on same symbol).
+    Calculates fixed 6% SL and 20% TP based on price change only, regardless of leverage.
     """
     try:
         positions = exchange.fetch_positions()
         result = {}
         
+        # Process positions by symbol and position side
         for pos in positions:
             # Filter only positions with non-zero amount
             position_amt = float(pos['info'].get('positionAmt', 0))
-            if abs(position_amt) > 0:
-                symbol = pos['symbol']
-                entry_price = float(pos['info'].get('entryPrice', 0))
+            if abs(position_amt) <= 0:
+                continue
                 
-                # Get position information directly from exchange
-                leverage = float(pos['info'].get('leverage', 10))
-                position_type = 'long' if position_amt > 0 else 'short'
+            symbol = pos['symbol']
+            entry_price = float(pos['info'].get('entryPrice', 0))
+            
+            # Get position side explicitly from exchange data for hedge mode support
+            # In hedge mode, positionSide will be 'LONG' or 'SHORT'
+            # In one-way mode, it will typically be 'BOTH'
+            position_side = pos['info'].get('positionSide', 'BOTH')
+            
+            # Determine position type based on amount and position side
+            if position_side == 'LONG' or (position_side == 'BOTH' and position_amt > 0):
+                position_type = 'long'
+            elif position_side == 'SHORT' or (position_side == 'BOTH' and position_amt < 0):
+                position_type = 'short'
+            else:
+                # Skip if we can't determine position type
+                logger.warning(f"Skipping position with unknown type: {pos['info']}")
+                continue
+            
+            # Get position information directly from exchange
+            leverage = float(pos['info'].get('leverage', 10))
+            
+            # Handle position keys differently in hedge mode
+            position_key = symbol
+            if ENABLE_HEDGE_MODE and position_side != 'BOTH':
+                # In hedge mode, use symbol_LONG or symbol_SHORT as key
+                position_key = f"{symbol}_{position_side}"
+            
+            # Get position open time - try to extract or use a fallback
+            entry_time = None
+            try:
+                # Try to get updateTime from position info (when position was last modified)
+                update_time = float(pos['info'].get('updateTime', 0))
+                if update_time > 0:
+                    entry_time = update_time / 1000  # Convert to seconds
                 
-                # Get position open time - try to extract or use a fallback
-                entry_time = None
-                try:
-                    # Try to get updateTime from position info (when position was last modified)
-                    update_time = float(pos['info'].get('updateTime', 0))
-                    if update_time > 0:
-                        entry_time = update_time / 1000  # Convert to seconds
-                    
-                    # Or try to get time from position_entry_times if available
-                    if not entry_time and symbol in position_entry_times:
-                        entry_time = position_entry_times[symbol]
-                except Exception:
-                    pass
+                # Or try to get time from position_entry_times if available
+                if not entry_time and position_key in position_entry_times:
+                    entry_time = position_entry_times[position_key]
+            except Exception:
+                pass
+            
+            # Use current time as fallback if we couldn't get entry time
+            if not entry_time:
+                entry_time = time.time() - 3600  # Assume 1 hour old as a reasonable fallback
+            
+            # Calculate position size in USD (initialMargin on Binance)
+            position_size_usd = float(pos['info'].get('initialMargin', 0))
+            
+            # If initialMargin is not available or zero, calculate it from notional value and leverage
+            if position_size_usd <= 0:
+                notional_value = abs(position_amt * entry_price)
+                position_size_usd = notional_value / leverage
+            
+            # Get current market price
+            ticker = exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+            
+            # FIXED: Calculate stop_loss with EXACT 6% price change (not dividing by leverage)
+            if position_type == 'long':
+                stop_loss = entry_price * 0.94  # Fixed 6% price decrease
+            else:  # short
+                stop_loss = entry_price * 1.06  # Fixed 6% price increase
+            
+            # FIXED: Calculate target with EXACT 20% price change (not dividing by leverage)
+            if position_type == 'long':
+                target_price = entry_price * 1.2  # Fixed 20% price increase
+            else:  # short
+                target_price = entry_price * 0.8  # Fixed 20% price decrease
+            
+            # Calculate current profit percentage with leverage
+            if position_type == 'long':
+                price_change_pct = ((current_price - entry_price) / entry_price) * 100
+            else:  # short
+                price_change_pct = ((entry_price - current_price) / entry_price) * 100
+            current_profit_pct = price_change_pct * leverage
+            
+            # Get max profit tracking
+            with max_profit_lock:
+                max_profit_pct_tracked = max_profit_tracking.get(position_key, 0)
                 
-                # Use current time as fallback if we couldn't get entry time
-                if not entry_time:
-                    entry_time = time.time() - 3600  # Assume 1 hour old as a reasonable fallback
-                
-                # Calculate position size in USD (initialMargin on Binance)
-                position_size_usd = float(pos['info'].get('initialMargin', 0))
-                
-                # If initialMargin is not available or zero, calculate it from notional value and leverage
-                if position_size_usd <= 0:
-                    notional_value = abs(position_amt * entry_price)
-                    position_size_usd = notional_value / leverage
-                
-                # Get current market price
-                ticker = exchange.fetch_ticker(symbol)
-                current_price = ticker['last']
-                
-                # FIXED: Calculate stop_loss with EXACT 6% price change (not dividing by leverage)
-                if position_type == 'long':
-                    stop_loss = entry_price * 0.94  # Fixed 6% price decrease
-                else:  # short
-                    stop_loss = entry_price * 1.06  # Fixed 6% price increase
-                
-                # FIXED: Calculate target with EXACT 20% price change (not dividing by leverage)
-                if position_type == 'long':
-                    target_price = entry_price * 1.2  # Fixed 20% price increase
-                else:  # short
-                    target_price = entry_price * 0.8  # Fixed 20% price decrease
-                
-                # Calculate current profit percentage with leverage
-                if position_type == 'long':
-                    price_change_pct = ((current_price - entry_price) / entry_price) * 100
-                else:  # short
-                    price_change_pct = ((entry_price - current_price) / entry_price) * 100
-                current_profit_pct = price_change_pct * leverage
-                
-                # Get or initialize pyramid data
-                # Calculate pyramid count directly from position size
-                pyramid_count = int(round(position_size_usd / AMOUNT_INCREMENT))
-                # Cap at 0 minimum (no negative values)
-                pyramid_count = max(0, pyramid_count)
+                # Update max_profit_pct_tracked if current profit is higher
+                if current_profit_pct > max_profit_pct_tracked:
+                    max_profit_tracking[position_key] = current_profit_pct
+                    max_profit_pct_tracked = current_profit_pct # Use the updated value immediately
+            
+            # Get pyramid data with position_key for hedge mode support
+            with pyramid_lock:
+                pyramid_count = 0
                 pyramid_entries = []
-                with pyramid_lock:
-                    if symbol in pyramid_details:                        
-                        pyramid_entries = pyramid_details[symbol].get('entries', [])
-                    else:
-                        # Initialize pyramid tracking for new positions
-                        pyramid_details[symbol] = {'count': 0, 'entries': []}
                 
-                # Get max profit tracking if available
-                max_profit = current_profit_pct
-                with max_profit_lock:
-                    if symbol in max_profit_tracking:
-                        stored_max_profit = max_profit_tracking[symbol]
-                        if stored_max_profit > current_profit_pct:
-                            max_profit = stored_max_profit
-                        else:
-                            # Update if current profit is higher than stored max
-                            max_profit_tracking[symbol] = current_profit_pct
-                    else:
-                        # Initialize with current profit
-                        max_profit_tracking[symbol] = current_profit_pct
-                
-                # Calculate highest_reached and lowest_reached based on position type and price
-                highest_reached = None
-                lowest_reached = None
-                if position_type == 'long':
-                    highest_reached = current_price  # Default to current price
-                else:  # short
-                    lowest_reached = current_price   # Default to current price
-                
-                # Calculate average entry price if we have pyramid entries
-                avg_entry_price = entry_price
-                original_entry_price = entry_price
-                
-                # Combine all data into one comprehensive position info structure
-                result[symbol] = {
-                    'symbol': symbol,
-                    'position_type': position_type,
-                    'entry_price': entry_price,
-                    'current_price': current_price,
-                    'quantity': abs(position_amt),
-                    'position_size_usd': position_size_usd,
-                    'leverage': leverage,
-                    'stop_loss': stop_loss,
-                    'target': target_price,
-                    'entry_time': entry_time,
-                    'current_profit_pct': current_profit_pct,
-                    'max_profit_pct': max_profit,
-                    'pyramid_count': pyramid_count,
-                    'pyramid_entries': pyramid_entries,
-                    'avg_entry_price': avg_entry_price,
-                    'original_entry_price': original_entry_price,
-                    'highest_reached': highest_reached,
-                    'lowest_reached': lowest_reached
-                }
+                if position_key in pyramid_details:
+                    pyramid_details_data = pyramid_details[position_key]
+                    pyramid_count = pyramid_details_data.get('count', 0)
+                    pyramid_entries = pyramid_details_data.get('entries', [])
+                else:
+                    # Initialize pyramid tracking for new positions
+                    pyramid_details[position_key] = {'count': 0, 'entries': []}
+                    
+                # Fallback: Calculate pyramid count from position size if tracking is empty
+                if pyramid_count == 0 and position_size_usd > BASE_AMOUNT_USD:
+                    pyramid_count = int(round(position_size_usd / AMOUNT_INCREMENT))
+                    pyramid_count = max(0, pyramid_count)
+            
+            # Calculate average entry price if we have pyramid entries
+            avg_entry_price = entry_price
+            original_entry_price = entry_price
+            
+            # If we have pyramid entries with valid price data, calculate weighted average
+            if pyramid_entries and len(pyramid_entries) > 0:
+                try:
+                    total_qty = abs(position_amt)
+                    sum_price_qty = entry_price * total_qty
+                    
+                    # Note: We're not actually recalculating average entry here
+                    # because the exchange already provides it in entry_price
+                    # This is just for completeness if you wanted to implement it
+                    
+                    # Identify original entry price (first entry)
+                    if pyramid_entries[0].get('price', 0) > 0:
+                        original_entry_price = pyramid_entries[0]['price']
+                except Exception as e:
+                    logger.warning(f"Error calculating avg entry price for {position_key}: {e}")
+            
+            # Combine all data into one comprehensive position info structure
+            result[position_key] = {
+                'symbol': symbol,
+                'position_type': position_type,
+                'position_side': position_side,  # Store actual exchange position side
+                'entry_price': entry_price,
+                'current_price': current_price,
+                'quantity': abs(position_amt),
+                'position_size_usd': position_size_usd,
+                'leverage': leverage,
+                'stop_loss': stop_loss,
+                'target': target_price,
+                'entry_time': entry_time,
+                'current_profit_pct': current_profit_pct,
+                'max_profit_pct': max_profit_pct_tracked,
+                'pyramid_count': pyramid_count,
+                'pyramid_entries': pyramid_entries,
+                'avg_entry_price': avg_entry_price,
+                'original_entry_price': original_entry_price,
+                'hedge_mode': ENABLE_HEDGE_MODE
+            }
         
         return result
     except Exception as e:
@@ -653,9 +694,9 @@ def check_for_pyramid_entries(exchange):
                     entry_side,
                     quantity,
                     current_price,
-                    leverage=leverage
+                    leverage=leverage,
+                    positionSide=position_type.upper()  # Explicitly set position side based on position type
                 )
-
                 if pyramid_order:
                     # Use executed price if available, otherwise market price estimate
                     executed_price = pyramid_order.get('average', current_price) if pyramid_order.get('average') else current_price
@@ -687,258 +728,477 @@ def check_for_pyramid_entries(exchange):
 
 def check_for_position_exits(exchange):
     """
-    Check for position exits using hybrid approach combining KAMA trend and price action.
-    Protects against large adverse price movements within candles.
+    Checks open positions for exit conditions based on indicator signals or price reversal for hedge mode.
+    Enhanced with a strict 8% price change exit rule to limit losses.
     """
     try:
         # Get open positions directly from exchange
         open_positions = fetch_open_positions(exchange)
         
         if not open_positions:
+            # logger.debug("No open positions to check for exits.") # Optional: reduce noise
             return
             
-        logger.info(f"Checking {len(open_positions)} open positions for exit conditions")
+        logger.info(f"Checking {len(open_positions)} open positions for exit/hedge conditions")
         
-        for symbol in open_positions.keys():
+        for position_key, position_info in open_positions.items():
             try:
                 # Get position details from exchange data
-                position_info = open_positions[symbol]
+                symbol = position_info['symbol']
                 position_type = position_info['position_type']
+                position_side = position_info.get('position_side', 'BOTH')  # For hedge mode
                 entry_price = position_info['entry_price']
-                avg_entry_price = position_info.get('avg_entry_price', entry_price)
+                avg_entry_price = position_info.get('avg_entry_price', entry_price) # Used for recording results
                 current_price = position_info['current_price']
                 current_profit_pct = position_info['current_profit_pct']
-                max_profit_pct = position_info['max_profit_pct']
-                pyramid_count = position_info['pyramid_count']
-                pyramid_entries = position_info['pyramid_entries']
+                max_profit_pct = position_info['max_profit_pct']  # Max profit from exchange data
                 quantity = position_info['quantity']
-                stop_loss = position_info['stop_loss']
+                position_size_usd = position_info['position_size_usd']
                 leverage = position_info['leverage']
                 entry_time = position_info['entry_time']
                 
-                # ENFORCE MINIMUM HOLD PERIOD (5 minutes)
-                current_time = time.time()
-                hold_time_minutes = (current_time - entry_time) / 60
+                # --- NEW: 8% PRICE CHANGE EXIT CHECK ---
+                # Calculate the raw price change percentage (without leverage)
+                if position_type == 'short':
+                    # For shorts: price moving up is unfavorable
+                    price_change_pct = ((current_price - entry_price) / entry_price) * 100
+                    unfavorable_move = price_change_pct > 0  # Price increased from entry
+                else:  # 'long'
+                    # For longs: price moving down is unfavorable
+                    price_change_pct = ((entry_price - current_price) / entry_price) * 100
+                    unfavorable_move = price_change_pct > 0  # Price decreased from entry
                 
-                # Skip exit check if minimum hold time not met
-                if hold_time_minutes < 5:
-                    remaining_minutes = int(5 - hold_time_minutes)
-                    logger.info(f"Skipping exit check for {symbol}: Position held for {hold_time_minutes:.1f} minutes, " 
-                               f"minimum required: 5 minutes (wait {remaining_minutes} more minutes)")
-                    continue
+                # Check if we need to exit due to 8% price change
+                MAX_PRICE_CHANGE_PCT = 8.0  # 8% max allowed price change
                 
-                # Get inverted side for exit orders
+                # If price has moved unfavorably by 8% or more, exit the position
+                if unfavorable_move and abs(price_change_pct) >= MAX_PRICE_CHANGE_PCT:
+                    # Determine exit side (opposite of position)
+                    exit_side = 'buy' if position_type == 'short' else 'sell'
+                    
+                    logger.info(f"MAX PRICE CHANGE EXIT: {symbol} {position_type.upper()} - " +
+                              f"Price moved {price_change_pct:.2f}% against entry. " +
+                              f"Current: {current_price:.6f}, Entry: {entry_price:.6f}")
+                    
+                    # Place reduce-only order to close the entire position
+                    exit_order = place_order(
+                        exchange, 
+                        symbol, 
+                        exit_side, 
+                        quantity, 
+                        current_price,
+                        reduceOnly=True, 
+                        positionSide=position_side if ENABLE_HEDGE_MODE else None
+                    )
+                    
+                    if exit_order:
+                        logger.info(f"Successfully closed {symbol} {position_type.upper()} position due to 8% price change." +
+                                  f" Raw price change: {price_change_pct:.2f}%, Leveraged P/L: {current_profit_pct:.2f}%")
+                        
+                        # Record trade result
+                        record_trade_result(
+                            symbol, avg_entry_price, current_price, position_type, 
+                            entry_time, leverage=leverage
+                        )
+                        
+                        # Clean up tracking data
+                        with pyramid_lock:
+                            if position_key in pyramid_details: del pyramid_details[position_key]
+                        with max_profit_lock:
+                            if position_key in max_profit_tracking: del max_profit_tracking[position_key]
+                        with cooldown_lock:
+                            if position_key in position_entry_times: del position_entry_times[position_key]
+                        
+                        # Set cooldown after exit
+                        with cooldown_lock:
+                            cooldown_end_time = time.time() + (SYMBOL_COOLDOWN_MINUTES * 60)
+                            symbol_cooldowns[symbol] = cooldown_end_time
+                            logger.info(f"Initiated {SYMBOL_COOLDOWN_MINUTES} min cooldown for {symbol}")
+                        
+                        # Skip to the next position as this one is now closed
+                        continue
+                    else:
+                        logger.error(f"Failed to place 8% max price change exit order for {symbol}")
+                # --- END 8% PRICE CHANGE EXIT CHECK ---
+                
+                # --- IMPROVED EXCHANGE-BASED REVERSE PYRAMID CHECK ---
+                try:
+                    # Define minimum viable position size - never reduce below this
+                    min_viable_size = BASE_AMOUNT_USD / 2
+                    
+                    # Only consider reducing if position is larger than base amount
+                    if position_size_usd > BASE_AMOUNT_USD:
+                        # Calculate reduction threshold based on inferred extreme prices from max profit
+                        threshold_pct = HYBRID_EXIT_CONFIG.get('extreme_kama_threshold', 2.0)
+                        
+                        if position_type == 'short':
+                            # For shorts: Infer lowest price reached based on max profit
+                            if max_profit_pct > 0:
+                                # Calculate the inferred lowest price the position reached
+                                inferred_lowest_price = entry_price * (1 - (max_profit_pct / (100 * leverage)))
+                                # Set reverse threshold as threshold_pct% above the lowest price
+                                reverse_threshold = inferred_lowest_price * (1 + threshold_pct/100)
+                            else:
+                                # If no profit recorded, use entry price as fallback
+                                reverse_threshold = entry_price * (1 + threshold_pct/100)
+                                
+                            reverse_triggered = current_price >= reverse_threshold
+                            close_side = 'buy'  # Buy to close short
+                            
+                        else:  # 'long'
+                            # For longs: Infer highest price reached based on max profit
+                            if max_profit_pct > 0:
+                                # Calculate the inferred highest price the position reached
+                                inferred_highest_price = entry_price * (1 + (max_profit_pct / (100 * leverage)))
+                                # Set reverse threshold as threshold_pct% below the highest price
+                                reverse_threshold = inferred_highest_price * (1 - threshold_pct/100)
+                            else:
+                                # If no profit recorded, use entry price as fallback
+                                reverse_threshold = entry_price * (1 - threshold_pct/100)
+                                
+                            reverse_triggered = current_price <= reverse_threshold
+                            close_side = 'sell'  # Sell to close long
+                        
+                        # Skip if position already at or below minimum viable size
+                        if position_size_usd <= min_viable_size:
+                            logger.info(f"Skipping reduction for {symbol} {position_type}: Position size ${position_size_usd:.2f} " +
+                                       f"already at or below minimum viable size (${min_viable_size:.2f})")
+                            continue
+                        
+                        if reverse_triggered:
+                            # Prepare log message with inferred extreme price information
+                            if position_type == 'short' and max_profit_pct > 0:
+                                logger.info(f"EXCHANGE-BASED REVERSE PYRAMID: {symbol} {position_type.upper()} - " +
+                                          f"Price {current_price:.6f} has reversed {threshold_pct}% from inferred low " +
+                                          f"of {inferred_lowest_price:.6f} (MaxProfit: {max_profit_pct:.2f}%)")
+                            elif position_type == 'long' and max_profit_pct > 0:
+                                logger.info(f"EXCHANGE-BASED REVERSE PYRAMID: {symbol} {position_type.upper()} - " +
+                                          f"Price {current_price:.6f} has reversed {threshold_pct}% from inferred high " +
+                                          f"of {inferred_highest_price:.6f} (MaxProfit: {max_profit_pct:.2f}%)")
+                            else:
+                                logger.info(f"EXCHANGE-BASED REVERSE PYRAMID: {symbol} {position_type.upper()} - " +
+                                          f"Price {current_price:.6f} has moved {threshold_pct}% against entry {entry_price:.6f}")
+                            
+                            # Calculate reduction amount (BASE_AMOUNT_USD or remaining if smaller)
+                            # This ensures we don't reduce below the minimum viable size
+                            reduction_size_usd = min(BASE_AMOUNT_USD, position_size_usd - min_viable_size)
+                            
+                            # Skip if reduction amount too small or would make position too small
+                            if reduction_size_usd <= 0:
+                                logger.info(f"Skipping reduction for {symbol}: Reduction amount {reduction_size_usd:.2f} too small")
+                                continue
+                            
+                            # Calculate quantity to reduce using existing function
+                            reduction_qty = get_order_quantity(
+                                exchange, symbol, current_price, leverage, reduction_size_usd
+                            )
+                            
+                            # Safety check: Cap at available quantity minus a small buffer
+                            max_reduction_qty = quantity * 0.95  # 95% of total to avoid errors
+                            reduction_qty = min(reduction_qty, max_reduction_qty)
+                            
+                            if reduction_qty <= 0:
+                                logger.warning(f"Invalid reduction quantity {reduction_qty:.8f} for {symbol}")
+                                continue
+                            
+                            # Place reduce-only order with proper position side for hedge mode
+                            reduce_order = place_order(
+                                exchange, 
+                                symbol, 
+                                close_side, 
+                                reduction_qty, 
+                                current_price,
+                                reduceOnly=True, 
+                                positionSide=position_side if ENABLE_HEDGE_MODE else None
+                            )
+                            
+                            if reduce_order:
+                                logger.info(f"Successfully reduced {symbol} {position_type.upper()} position by " +
+                                          f"{reduction_qty:.8f} (~${reduction_size_usd:.2f})")
+                                
+                                # Refresh position data after reduction
+                                refreshed_positions = fetch_open_positions(exchange)
+                                
+                                # Check if position still exists using position key format
+                                if position_key in refreshed_positions:
+                                    # Update local variables with fresh data
+                                    position_info = refreshed_positions[position_key]
+                                    quantity = position_info['quantity']
+                                    current_price = position_info['current_price']
+                                    current_profit_pct = position_info['current_profit_pct']
+                                    position_size_usd = position_info['position_size_usd']
+                                else:
+                                    logger.info(f"Position for {symbol} fully closed after reduction")
+                                    continue  # Skip to next position
+                            else:
+                                logger.error(f"Failed to place reduction order for {symbol}")
+                except Exception as e:
+                    logger.error(f"Error in reverse pyramid check for {symbol}: {e}")
+                # --- END IMPROVED EXCHANGE-BASED REVERSE PYRAMID CHECK ---
+
+                # Get inverted side for exit/hedge orders
                 inverted_side = 'buy' if position_type == 'short' else 'sell'
-                
-                # REGULAR EXIT LOGIC - Use signal data properly
+
+                # --- NEW: Price Reversal Check (for Hedge Triggering) ---
+                hedge_reversal_triggered = False
+                hedge_reversal_reason = ""
+                HEDGE_REVERSAL_THRESHOLD_PCT = 3.0 # Define your reversal threshold (e.g., 3%)
+
+                # Update max profit tracking
+                with max_profit_lock:
+                    max_profit_pct_tracked = max_profit_tracking.get(position_key, 0)
+                    if current_profit_pct > max_profit_pct_tracked:
+                        logger.debug(f"Updating max profit for {position_key} from {max_profit_pct_tracked:.2f}% to {current_profit_pct:.2f}%")
+                        max_profit_tracking[position_key] = current_profit_pct
+                        max_profit_pct_tracked = current_profit_pct
+
+                if max_profit_pct_tracked > 0.5: 
+                    # Case 1: Position was significantly profitable at some point.
+                    # Check for reversal from the inferred extreme point based on max profit.
+                    reversal_source = "inferred extreme"
+                    if position_type == 'short':
+                        try:
+                            inferred_lowest_price = entry_price * (1 - (max_profit_pct_tracked / (100 * leverage)))
+                            reversal_target_price = inferred_lowest_price * (1 + HEDGE_REVERSAL_THRESHOLD_PCT / 100)
+                            if current_price >= reversal_target_price:
+                                hedge_reversal_triggered = True
+                        except Exception as calc_e:
+                             logger.warning(f"Error calculating inferred low for {position_key}: {calc_e}")
+                    elif position_type == 'long':
+                        try:
+                            inferred_highest_price = entry_price * (1 + (max_profit_pct_tracked / (100 * leverage)))
+                            reversal_target_price = inferred_highest_price * (1 - HEDGE_REVERSAL_THRESHOLD_PCT / 100)
+                            if current_price <= reversal_target_price:
+                                hedge_reversal_triggered = True
+                        except Exception as calc_e:
+                            logger.warning(f"Error calculating inferred high for {position_key}: {calc_e}")
+                else:
+                    # Case 2: Position never reached > 0.5% profit OR is currently in loss.
+                    # Check for reversal *relative to the entry price*. This catches reversals
+                    # that happened after the price moved against the entry initially.
+                    reversal_source = "near entry"
+                    if position_type == 'short':
+                        # If price is now 3% ABOVE entry, trigger hedge (significant reversal)
+                        reversal_target_price = entry_price * (1 + HEDGE_REVERSAL_THRESHOLD_PCT / 100)
+                        if current_price >= reversal_target_price:
+                            hedge_reversal_triggered = True
+                    elif position_type == 'long':
+                        # If price is now 3% BELOW entry, trigger hedge (significant reversal)
+                        reversal_target_price = entry_price * (1 - HEDGE_REVERSAL_THRESHOLD_PCT / 100)
+                        if current_price <= reversal_target_price:
+                             hedge_reversal_triggered = True
+
+                # Set the reason string if triggered
+                if hedge_reversal_triggered:
+                     hedge_reversal_reason = (f"Price reversed {HEDGE_REVERSAL_THRESHOLD_PCT}% from {reversal_source}: "
+                                              f"Current {current_price:.6f} vs Target {reversal_target_price:.6f} "
+                                              f"(Entry: {entry_price:.6f}, MaxProfit: {max_profit_pct_tracked:.2f}%)")
+                     logger.info(f"HEDGE REVERSAL TRIGGER ({position_type.upper()}) for {symbol}: {hedge_reversal_reason}")
+                # --- END NEW: Price Reversal Check ---
+
+
+                # REGULAR EXIT LOGIC (Based on Indicator)
                 try:
                     # Get indicator and generate signal ONCE
                     indicator = get_momentum_indicator(symbol, exchange)
                     if not indicator:
-                        continue
-                        
-                    df = fetch_extended_historical_data(exchange, symbol, MOMENTUM_TIMEFRAME)
-                    if df is None or len(df) < 100:
-                        continue
-                        
-                    indicator.update_price_data(df)
-                    
-                    # IMPORTANT FIX: Generate signal ONCE with current position info
-                    signal = indicator.generate_signal(
-                        current_position=position_type, 
-                        entry_price=entry_price, 
-                        stop_loss=stop_loss
-                    )
-                    
-                    # Update max profit tracking
-                    with max_profit_lock:
-                        if symbol not in max_profit_tracking or current_profit_pct > max_profit_tracking[symbol]:
-                            max_profit_tracking[symbol] = current_profit_pct
-                            max_profit_pct = current_profit_pct
-                    
-                    # Calculate profit retracement
-                    profit_retracement = max_profit_pct - current_profit_pct
-                    retracement_ratio = profit_retracement / max_profit_pct if max_profit_pct > 0 else 0
-                    
-                    # Get reversal info directly from signal
-                    is_reversal = signal.get('is_reversal', False)
-                    reversal_strength = signal.get('reversal_strength', 0)
-                    reversal_reason = signal.get('reversal_reason', "")
-                    
-                    # FIX: Use exit signal data directly instead of recalculating
-                    exit_triggered = signal.get('exit_triggered', False)
-                    exit_reason = signal.get('reason', "")
-                    should_reverse = signal.get('execute_reversal', False)
-                    
-                    # HYBRID APPROACH: Combine KAMA trend with price action safeguards
-                    kama_value = None
-                    is_open_above_kama = False
-                    is_high_above_kama = False
-                    is_volatile_candle = False
-                    
-                    # Get KAMA value
-                    kama_columns = [col for col in df.columns if col.startswith('kama_')]
-                    if kama_columns and len(df) > 0:
-                        kama_column = kama_columns[0]
-                        kama_value = df[kama_column].iloc[-1]
-                        
-                        if kama_value is not None and len(df) > 0:
-                            # Get current candle data
-                            current_open = df['open'].iloc[-1]
-                            current_high = df['high'].iloc[-1]
-                            current_low = df['low'].iloc[-1]
-                            current_close = df['close'].iloc[-1]
+                        logger.warning(f"Could not get momentum indicator for {symbol}. Skipping indicator check.")
+                        indicator_exit_triggered = False
+                        indicator_exit_reason = "Indicator unavailable"
+                        should_reverse = False # Cannot determine reversal without indicator
+                    else:
+                        df = fetch_extended_historical_data(exchange, symbol, MOMENTUM_TIMEFRAME)
+                        if df is None or len(df) < 100:
+                            logger.warning(f"Insufficient historical data for {symbol} indicator check.")
+                            indicator_exit_triggered = False
+                            indicator_exit_reason = "Insufficient data for indicator"
+                            should_reverse = False
+                        else:
+                            indicator.update_price_data(df)
                             
-                            # Calculate percentage differences
-                            exit_gap_percent = ((current_open - kama_value) / kama_value) * 100
-                            high_gap_percent = ((current_high - kama_value) / kama_value) * 100
+                            # Pass original indicator SL if available, otherwise maybe the fixed one?
+                            # Let's assume indicator recalculates its own based on current data
+                            indicator_sl = indicator.determine_stop_loss(df, position_type, entry_price) 
                             
-                            # Calculate candle volatility
-                            candle_range = current_high - current_low
-                            volatility_percent = (candle_range / current_low) * 100
-                            
-                            # Check conditions
-                            is_open_above_kama = exit_gap_percent >= 1.0  # Original condition
-                            is_high_above_kama = high_gap_percent >= 2.5  # New: high is significantly above KAMA
-                            is_volatile_candle = volatility_percent >= 3.0  # New: candle shows high volatility
-                            
-                            # For short positions, implement hybrid exit strategy
-                            if position_type == 'short':
-                                # Exit if open is above KAMA (original condition)
-                                if is_open_above_kama:
-                                    exit_triggered = True
-                                    exit_reason = f"SHORT exit: Open price ({current_open:.6f}) is {exit_gap_percent:.2f}% above KAMA ({kama_value:.6f})"
-                                
-                                # OR exit if high is significantly above KAMA even if open wasn't
-                                elif is_high_above_kama:
-                                    exit_triggered = True
-                                    exit_reason = f"SHORT exit: High price ({current_high:.6f}) reached {high_gap_percent:.2f}% above KAMA ({kama_value:.6f})"
-                                
-                                # OR exit if candle shows extreme volatility (potential large adverse move)
-                                elif is_volatile_candle and current_close > current_open:
-                                    exit_triggered = True 
-                                    exit_reason = f"SHORT exit: Volatile candle detected ({volatility_percent:.2f}% range) with bullish close"
-                                
-                                # Log detailed analysis even if not exiting
-                                if not exit_triggered and (is_high_above_kama or is_volatile_candle):
-                                    logger.info(f"CAUTION for {symbol}: High nearly breached KAMA ({high_gap_percent:.2f}%) " 
-                                              f"with {volatility_percent:.2f}% candle volatility")
-                            
-                            # For long positions, implement mirror hybrid exit strategy  
-                            elif position_type == 'long':
-                                # Calculate downside gaps
-                                low_gap_percent = ((kama_value - current_low) / kama_value) * 100
-                                open_below_gap = ((kama_value - current_open) / kama_value) * 100
-                                
-                                # Exit if open is below KAMA by threshold
-                                is_open_below_kama = open_below_gap >= 1.0
-                                is_low_below_kama = low_gap_percent >= 2.5
-                                
-                                if is_open_below_kama:
-                                    exit_triggered = True
-                                    exit_reason = f"LONG exit: Open price ({current_open:.6f}) is {open_below_gap:.2f}% below KAMA ({kama_value:.6f})"
-                                
-                                # OR exit if low is significantly below KAMA
-                                elif is_low_below_kama:
-                                    exit_triggered = True
-                                    exit_reason = f"LONG exit: Low price ({current_low:.6f}) reached {low_gap_percent:.2f}% below KAMA ({kama_value:.6f})"
-                                
-                                # OR exit if candle shows extreme volatility with bearish close
-                                elif is_volatile_candle and current_close < current_open:
-                                    exit_triggered = True
-                                    exit_reason = f"LONG exit: Volatile candle detected ({volatility_percent:.2f}% range) with bearish close"
-                                
-                                # Log detailed analysis even if not exiting
-                                if not exit_triggered and (is_low_below_kama or is_volatile_candle):
-                                    logger.info(f"CAUTION for {symbol}: Low nearly breached KAMA ({low_gap_percent:.2f}%) " 
-                                              f"with {volatility_percent:.2f}% candle volatility")
-                    
-                    # If signal doesn't contain exit info, check additional conditions
-                    if not exit_triggered:
-                        # Check profit retracement
-                        if max_profit_pct > 20:
-                            retracement_threshold = 0.4 - (0.05 * pyramid_count)
-                            retracement_threshold = max(0.25, retracement_threshold)
-                            
-                            if retracement_ratio > retracement_threshold:
-                                exit_triggered = True
-                                exit_reason = f"Profit retracement: {profit_retracement:.1f}% ({retracement_ratio:.2f}) "
-                                exit_reason += f"from max {max_profit_pct:.1f}% [Threshold: {retracement_threshold:.2f}]"
-                                should_reverse = is_reversal and reversal_strength > 50
-                        
-                        # Check strong reversal signal
-                        elif is_reversal and reversal_strength >= 70:
-                            exit_triggered = True
-                            exit_reason = f"Strong reversal signal detected ({reversal_strength}): {reversal_reason}"
-                            should_reverse = True   
-                    
-                    # Check fixed stop loss (6% price change)
-                    if current_price >= stop_loss and position_type == 'short':
-                        exit_triggered = True
-                        exit_reason = f"Price {current_price} hit stop loss at {stop_loss} (6% above entry)"
-                    elif current_price <= stop_loss and position_type == 'long':
-                        exit_triggered = True
-                        exit_reason = f"Price {current_price} hit stop loss at {stop_loss} (6% below entry)"
-                    
-                    # Process the exit if needed
-                    if exit_triggered:
-                        logger.info(f"EXIT SIGNAL for {symbol} {position_type.upper()}: {exit_reason}")
-                        
-                        # Close position
-                        exit_order = place_order(
-                            exchange, 
-                            symbol, 
-                            inverted_side, 
-                            quantity, 
-                            current_price, 
-                            reduceOnly=True
-                        )
-                        
-                        if exit_order:
-                            logger.info(f"Successfully exited {symbol} {position_type.upper()} position. "
-                                      f"Profit: {current_profit_pct:.2f}% [with {leverage}x leverage]")
-                            
-                            # Record trade result
-                            record_trade_result(
-                                symbol,
-                                avg_entry_price,
-                                current_price,
-                                position_type,
-                                position_info['entry_time'],
-                                leverage=leverage
+                            signal = indicator.generate_signal(
+                                current_position=position_type,
+                                entry_price=entry_price,
+                                stop_loss=indicator_sl # Pass the indicator's calculated SL
                             )
                             
-                            # Handle reversal if applicable
-                            if should_reverse and ENABLE_AUTO_REVERSALS:
-                                logger.info(f"Attempting position reversal for {symbol} based on {exit_reason}")
-                                handle_position_reversal(
-                                    exchange,
-                                    symbol,
-                                    reversal_strength,
-                                    position_type,
-                                    current_profit_pct
-                                )
-                            else:
-                                # Clean up tracking
-                                with pyramid_lock:
-                                    if symbol in pyramid_details:
-                                        del pyramid_details[symbol]
-                                        
-                                with max_profit_lock:
-                                    if symbol in max_profit_tracking:
-                                        del max_profit_tracking[symbol]
-                        else:
-                            logger.error(f"Failed to exit position for {symbol}")
+                            indicator_exit_triggered = signal.get('exit_triggered', False)
+                            indicator_exit_reason = signal.get('reason', "")
+                            should_reverse = signal.get('execute_reversal', False) # For full reversals, not hedges
+
+                    # --- MODIFIED: Combine Triggers for Hedge/Exit ---
+                    # An action (hedge or exit) is needed if the indicator says exit OR price reversal occurred
+                    action_triggered = indicator_exit_triggered or hedge_reversal_triggered
+                    # Prioritize reversal reason if it triggered
+                    action_reason = hedge_reversal_reason if hedge_reversal_triggered else indicator_exit_reason
+
+                    if action_triggered:
+                        # ENFORCE MINIMUM HOLD PERIOD Check - Moved here to apply to both triggers
+                        current_time = time.time()
+                        hold_time_minutes = (current_time - entry_time) / 60
+                        
+                        if hold_time_minutes < MINIMUM_HOLD_MINUTES:
+                            remaining_minutes = int(MINIMUM_HOLD_MINUTES - hold_time_minutes)
+                            logger.info(f"Skipping action for {position_key} ({action_reason}): Position held for {hold_time_minutes:.1f} mins, " 
+                                       f"minimum required: {MINIMUM_HOLD_MINUTES} mins (wait {remaining_minutes} more mins)")
+                            continue # Skip to the next symbol if hold time not met
+
+                        logger.info(f"ACTION SIGNAL for {symbol} {position_type.upper()}: {action_reason}")
+
+                        # HEDGE MODE LOGIC
+                        if ENABLE_HEDGE_MODE:
+                            # Determine hedge direction and side
+                            hedge_type = 'long' if position_type == 'short' else 'short'
+                            hedge_side = 'buy' if hedge_type == 'long' else 'sell'
+                            # Get position side for the hedge
+                            hedge_position_side = 'LONG' if hedge_type == 'long' else 'SHORT'
+
+                            # Check if we already have a position in opposite direction
+                            has_opposite = False
+                            # Re-fetch fresh positions *just in case* state changed 
+                            current_exchange_positions = fetch_open_positions(exchange) 
                             
+                            # Check if an opposite position already exists and get its size
+                            opposite_position_key = f"{symbol}_{hedge_position_side}" if ENABLE_HEDGE_MODE else symbol
+                            opposite_position_size = 0
+                            
+                            for pos_key, pos in current_exchange_positions.items():
+                                if pos['symbol'] == symbol and pos['position_type'] == hedge_type:
+                                    has_opposite = True
+                                    opposite_position_size = pos['position_size_usd']
+                                    break
+
+                            if not has_opposite:
+                                # Enter a hedge position with BASE_AMOUNT_USD size
+                                hedge_size = BASE_AMOUNT_USD
+                                
+                                # Ensure the hedge position doesn't exceed MAX_AMOUNT_USD
+                                if opposite_position_size + hedge_size > MAX_AMOUNT_USD:
+                                    hedge_size = max(0, MAX_AMOUNT_USD - opposite_position_size)
+                                    logger.info(f"Limiting {hedge_type} hedge position size to ${hedge_size:.2f} to stay under MAX_AMOUNT_USD")
+                                
+                                # Skip if hedge size would be too small
+                                if hedge_size <= 0:
+                                    logger.info(f"Skipping hedge entry for {symbol}: Adjusted hedge size ${hedge_size:.2f} too small")
+                                    continue
+
+                                # Calculate quantity for hedge - REUSE existing function
+                                hedge_quantity = get_order_quantity(
+                                    exchange, symbol, current_price, leverage, hedge_size
+                                )
+
+                                if hedge_quantity > 0:
+                                    logger.info(f"HEDGE ENTRY ({action_reason}): Opening {hedge_type.upper()} position for {symbol} "
+                                              f"with size ${hedge_size:.2f} at ~{current_price:.6f}")
+
+                                    # Place hedge order - REUSE existing function
+                                    hedge_order = place_order(
+                                        exchange, symbol, hedge_side, hedge_quantity, current_price,
+                                        leverage=leverage, positionSide=hedge_position_side
+                                    )
+
+                                    if hedge_order:
+                                        logger.info(f"Successfully opened {hedge_type.upper()} hedge for {symbol}")
+                                        # Place TP for the NEW hedge position
+                                        place_tp_only_order(
+                                            exchange, symbol, hedge_side, hedge_quantity, leverage
+                                        )
+                                        
+                                        # Create key for the new hedge position
+                                        hedge_position_key = f"{symbol}_{hedge_position_side}" if ENABLE_HEDGE_MODE else symbol
+                                        
+                                        # Reset tracking for the *new* hedge position
+                                        with max_profit_lock: 
+                                            max_profit_tracking[hedge_position_key] = 0
+                                        with pyramid_lock: 
+                                            pyramid_details[hedge_position_key] = {'count': 0, 'entries': []}
+                                        with cooldown_lock: 
+                                            position_entry_times[hedge_position_key] = time.time()
+
+                                    else:
+                                        logger.error(f"Failed to place hedge order for {symbol}")
+                            else:
+                                logger.info(f"Already have {hedge_type} position for {symbol}, skipping hedge entry despite trigger: {action_reason}")
+
+                        # ORIGINAL EXIT LOGIC (Only runs if Hedge Mode is OFF and INDICATOR triggered exit)
+                        elif indicator_exit_triggered: 
+                            logger.info(f"Standard Exit Triggered (Hedge Mode OFF): {indicator_exit_reason}")
+                            
+                            # Use the current quantity from potentially updated position_info
+                            exit_quantity = quantity
+                            if exit_quantity <= 0:
+                                logger.warning(f"Skipping exit for {position_key}, quantity is zero or negative.")
+                                continue
+
+                            exit_order = place_order(
+                                exchange, symbol, inverted_side, exit_quantity, current_price,
+                                reduceOnly=True, 
+                                positionSide=position_side if ENABLE_HEDGE_MODE else None
+                            )
+
+                            if exit_order:
+                                logger.info(f"Successfully submitted exit order for {symbol} {position_type.upper()} position. "
+                                          f"Profit: {current_profit_pct:.2f}% [with {leverage}x leverage]")
+                                
+                                # Record trade result - Using avg_entry_price
+                                record_trade_result(
+                                    symbol, avg_entry_price, current_price, position_type, 
+                                    entry_time, leverage=leverage
+                                )
+                                
+                                # Handle full position reversal if applicable (based on indicator signal)
+                                if should_reverse and ENABLE_AUTO_REVERSALS:
+                                    logger.info(f"Attempting position reversal for {symbol} based on {indicator_exit_reason}")
+                                    # Note: handle_position_reversal implicitly closes the old one before opening new
+                                    reversed_ok = handle_position_reversal(
+                                        exchange, symbol, signal.get('reversal_strength', 0), 
+                                        position_type, current_profit_pct
+                                    )
+                                    if not reversed_ok:
+                                         # If reversal failed, still clean up old position tracking
+                                        with pyramid_lock:
+                                            if position_key in pyramid_details: del pyramid_details[position_key]
+                                        with max_profit_lock:
+                                            if position_key in max_profit_tracking: del max_profit_tracking[position_key]
+                                        with cooldown_lock:
+                                             if position_key in position_entry_times: del position_entry_times[position_key]
+                                else:
+                                    # Clean up tracking if just exited (no reversal)
+                                    with pyramid_lock:
+                                        if position_key in pyramid_details: del pyramid_details[position_key]
+                                    with max_profit_lock:
+                                        if position_key in max_profit_tracking: del max_profit_tracking[position_key]
+                                    with cooldown_lock:
+                                         if position_key in position_entry_times: del position_entry_times[position_key]
+
+                                # Set cooldown after successful exit/reversal attempt
+                                with cooldown_lock:
+                                    cooldown_end_time = time.time() + (SYMBOL_COOLDOWN_MINUTES * 60)
+                                    symbol_cooldowns[symbol] = cooldown_end_time
+                                    logger.info(f"Initiated {SYMBOL_COOLDOWN_MINUTES} min cooldown for {symbol} until {time.strftime('%H:%M:%S', time.localtime(cooldown_end_time))}")
+                                    # Clear consecutive stop loss count on successful exit
+                                    with consecutive_stop_loss_lock:
+                                        if symbol in consecutive_stop_losses:
+                                            del consecutive_stop_losses[symbol]
+
+                            else:
+                                logger.error(f"Failed to place exit order for {symbol}")
+                                
                 except Exception as e:
-                    logger.exception(f"Error in regular exit checks for {symbol}: {e}")
+                    logger.exception(f"Error during indicator/exit processing for {symbol}: {e}")
             
+            except KeyError as ke:
+                 logger.error(f"KeyError processing position for {position_key}: {ke}. Position data: {position_info}")
             except Exception as e:
-                logger.exception(f"Error checking exit for {symbol}: {e}")
-                continue
+                logger.exception(f"Outer error checking exit loop for {position_key}: {e}")
+                continue # Process next symbol
     
     except Exception as e:
-        logger.exception(f"Error in check_for_position_exits: {e}")
+        logger.exception(f"Critical error in check_for_position_exits main loop: {e}")
 def calculate_rsi(prices, window=14):
     """Calculate Relative Strength Index"""
     delta = prices.diff()
@@ -1058,9 +1318,9 @@ def record_trade_result(symbol, entry_price, exit_price, position_type, entry_ti
     logger.info(f"Recorded trade result for {symbol}: {profit_pct:.2f}% profit over {trade_result['duration_minutes']:.1f} minutes [with {leverage}x leverage]")
     return trade_result
 
-def close_partial_position(exchange, symbol, side, quantity, current_price, reduceOnly=True):
+def close_partial_position(exchange, symbol, side, quantity, current_price, reduceOnly=True, positionSide=None):
     """
-    Close a portion of an open position.
+    Close a portion of an open position with hedge mode support.
     
     Args:
         exchange: CCXT exchange instance
@@ -1069,21 +1329,31 @@ def close_partial_position(exchange, symbol, side, quantity, current_price, redu
         quantity: Position quantity to close
         current_price: Current market price (for logging)
         reduceOnly: Whether to use reduceOnly flag
+        positionSide: Position side to close ('LONG' or 'SHORT') - required for hedge mode
         
     Returns:
         order object or None on failure
     """
     try:
-        logger.info(f"Closing partial position for {symbol}: {side.upper()} {quantity:.8f} @ ~{current_price:.6f}")
+        # For hedge mode, determine position side if not provided
+        if ENABLE_HEDGE_MODE and not positionSide:
+            # In hedge mode, when closing:
+            # - 'buy' side typically closes a 'SHORT' position
+            # - 'sell' side typically closes a 'LONG' position
+            positionSide = 'SHORT' if side == 'buy' else 'LONG'
         
-        # Place the order
+        logger.info(f"Closing partial position for {symbol}: {side.upper()} {quantity:.8f} @ ~{current_price:.6f}" + 
+                  (f" (positionSide: {positionSide})" if ENABLE_HEDGE_MODE else ""))
+        
+        # Place the order with position side for hedge mode
         order = place_order(
             exchange,
             symbol,
             side,
             quantity,
             current_price,
-            reduceOnly=reduceOnly
+            reduceOnly=reduceOnly,
+            positionSide=positionSide
         )
         
         if order:
@@ -1443,14 +1713,14 @@ def find_momentum_candidates(exchange, sort_type='gainers', limit=20):
         sorted_short_symbols.extend(sorted_remaining_short)
         
         # Log top candidates
-        if len(sorted_short_symbols) > 0:
-            logger.info("Top momentum short candidates (20%+ gain in 24h, crossunder within 20 candles):")
-            for i, symbol in enumerate(sorted_short_symbols[:10]):
-                data = all_short_candidates[symbol]
-                status_emoji = "🟢" if data['signal_generated'] else ("🔥" if data['is_recent_crossunder'] else "⬇️")
-                logger.info(f"{i+1}. {symbol}: {data['gain_pct']:.2f}% gain, {data['drawdown_pct']:.2f}% down from high, "
-                       f"crossunder age: {data['crossunder_age']} candles, "
-                       f"{status_emoji} {'READY' if data['signal_generated'] else ('RECENT CROSSUNDER' if data['is_recent_crossunder'] else 'Potential')}")
+        # if len(sorted_short_symbols) > 0:
+        #     logger.info("Top momentum short candidates (20%+ gain in 24h, crossunder within 20 candles):")
+        #     for i, symbol in enumerate(sorted_short_symbols[:10]):
+        #         data = all_short_candidates[symbol]
+        #         status_emoji = "🟢" if data['signal_generated'] else ("🔥" if data['is_recent_crossunder'] else "⬇️")
+        #         logger.info(f"{i+1}. {symbol}: {data['gain_pct']:.2f}% gain, {data['drawdown_pct']:.2f}% down from high, "
+        #                f"crossunder age: {data['crossunder_age']} candles, "
+        #                f"{status_emoji} {'READY' if data['signal_generated'] else ('RECENT CROSSUNDER' if data['is_recent_crossunder'] else 'Potential')}")
         
         # Check if we have any valid momentum signals
         valid_short_signals = {s: sig for s, sig in stored_signals.items() if sig['signal'] == 'sell'}
@@ -1494,6 +1764,13 @@ def get_leverage_for_market(exchange, market_id, leverage_options=LEVERAGE_OPTIO
 def get_order_quantity(exchange, market_id, price, leverage, position_size=None):
     """Calculate order quantity based on position size and leverage."""
     try:
+        # FIXED: Strip position side suffix (_LONG or _SHORT) from market_id if present
+        if isinstance(market_id, str) and ('_LONG' in market_id or '_SHORT' in market_id):
+            # Extract the base symbol by removing the position side suffix
+            base_market_id = market_id.split('_')[0]
+            logger.info(f"Stripped position side suffix from market ID: {market_id} -> {base_market_id}")
+            market_id = base_market_id
+        
         # Use position_size if provided, otherwise use BASE_AMOUNT_USD
         amount_usd = position_size if position_size is not None else BASE_AMOUNT_USD
         
@@ -1515,87 +1792,156 @@ def get_order_quantity(exchange, market_id, price, leverage, position_size=None)
         logger.exception(f"Error calculating quantity for {market_id}: {e}")
         return 0.0
 
-def place_order(exchange, market_id, side, quantity, price, leverage=None, reduceOnly=False):
-    """
-    Simplified order placement function that places a market order.
-    Ensures isolated margin mode is set before placing the order.
-    Properly handles the reduceOnly parameter with fallback for errors.
-    """
+def place_order(exchange, market_id, side, quantity, price, leverage=None, reduceOnly=False, positionSide=None):
+    """Enhanced order placement function that supports hedge mode."""
     params = {}
+    
+    # FIXED: Strip position side suffix (_LONG or _SHORT) from market_id if present
+    if isinstance(market_id, str) and ('_LONG' in market_id or '_SHORT' in market_id):
+        # Extract the base symbol by removing the position side suffix
+        base_market_id = market_id.split('_')[0]
+        logger.info(f"Stripped position side suffix from market ID: {market_id} -> {base_market_id}")
+        market_id = base_market_id
     
     # Add reduceOnly parameter if specified
     if reduceOnly:
         params['reduceOnly'] = True
 
+    # Add positionSide for hedge mode if specified
+    if ENABLE_HEDGE_MODE:
+        # If positionSide not explicitly provided, set default based on side
+        if not positionSide:
+            positionSide = 'LONG' if side == 'buy' else 'SHORT'
+        params['positionSide'] = positionSide
+
     try:
-        # First, ensure the margin mode is set to "Isolated"
+        # First, ensure hedge mode is enabled
+        if ENABLE_HEDGE_MODE:
+            try:
+                account_info = exchange.fapiPrivateGetAccount()
+                current_mode = account_info.get('dualSidePosition', False)
+                if not current_mode:
+                    exchange.fapiPrivatePostPositionSideDual({'dualSidePosition': 'true'})
+                    logger.info("Switched to hedge mode for account")
+                    time.sleep(0.5)
+            except Exception as e:
+                logger.warning(f"Error checking/setting hedge mode: {e}")
+        
+        # Ensure isolated margin mode (unchanged)
         try:
-            # Check current margin mode
             position_info = exchange.fetch_positions([market_id])
             if position_info and len(position_info) > 0:
                 current_margin_mode = position_info[0].get('marginMode')
-                
-                # If not in isolated mode, set it to isolated
                 if current_margin_mode != 'isolated':
                     exchange.set_margin_mode('isolated', market_id)
-                    # Small delay to ensure the change takes effect
                     time.sleep(0.5)
             else:
-                # If no position info available, set to isolated mode anyway
                 exchange.set_margin_mode('isolated', market_id)
                 time.sleep(0.5)
-                
         except Exception as e:
             logger.warning(f"Error checking/setting margin mode for {market_id}: {e}")
-            # Continue with order placement as some exchanges may set isolated mode automatically
 
         # Get current market price
         ticker_data = exchange.fetch_ticker(market_id)
         latest_market_price = ticker_data['last']
         
-        # Log order details
-        logger.info(f"Placing {side.upper()} order for {market_id} - Qty: {quantity:.8f} at Market Price: {latest_market_price:.6f}, reduceOnly: {reduceOnly}")
+        # Log order details with hedge mode info
+        hedge_info = f" (positionSide: {positionSide})" if ENABLE_HEDGE_MODE else ""
+        logger.info(f"Placing {side.upper()} order for {market_id} - Qty: {quantity:.8f} at ~{latest_market_price:.6f}, reduceOnly: {reduceOnly}{hedge_info}")
         
-        # Place a simple market order
+        # Place market order
         try:
             market_order = exchange.create_order(market_id, 'MARKET', side, quantity, params=params)
         except ccxt.InvalidOrder as e:
-            # Check for reduceOnly rejection error
             if 'ReduceOnly Order is rejected' in str(e) and reduceOnly:
                 logger.warning(f"ReduceOnly order rejected for {market_id}. Attempting without reduceOnly parameter.")
-                # Try again without reduceOnly
-                params = {}  # Remove the reduceOnly parameter
+                params.pop('reduceOnly', None)
                 market_order = exchange.create_order(market_id, 'MARKET', side, quantity, params=params)
             else:
-                # Re-raise other InvalidOrder errors
                 raise
         
         # Log success
-        logger.info(f"Order successfully placed for {market_id}: {side.upper()} {quantity:.8f} @ {latest_market_price:.6f}, ID: {market_order.get('id', 'N/A')}")
+        logger.info(f"Order successfully placed for {market_id}: {side.upper()} {quantity:.8f} @ {latest_market_price:.6f}, ID: {market_order.get('id', 'N/A')}{hedge_info}")
         
-        # Record entry time for minimum hold time tracking
+        # Record entry time if not reducing
         if not reduceOnly:
+            # Use appropriate position key format in hedge mode
+            position_key = market_id
+            if ENABLE_HEDGE_MODE and positionSide:
+                position_key = f"{market_id}_{positionSide}"
+                
             with cooldown_lock:
-                position_entry_times[market_id] = time.time()
-                logger.info(f"Updated entry time for {market_id}")
+                position_entry_times[position_key] = time.time()
         
         return market_order
 
     except Exception as e:
         logger.exception(f"Error placing order for {market_id}: {e}")
         return None
-
+def check_for_hedged_position(open_positions, symbol, position_side=None):
+    """
+    Check if a symbol has an open position in the specified side when in hedge mode.
+    This helps determine if we already have a hedged position in the opposite direction.
+    
+    Args:
+        open_positions: Dictionary of open positions from fetch_open_positions
+        symbol: Trading pair symbol to check
+        position_side: Optional - specific position side to check ('LONG' or 'SHORT')
+        
+    Returns:
+        tuple: (has_position, position_info) where position_info is the position data if found
+    """
+    # If hedge mode is disabled, just check if the symbol exists in positions
+    if not ENABLE_HEDGE_MODE:
+        if symbol in open_positions:
+            return True, open_positions[symbol]
+        return False, None
+    
+    # In hedge mode, we need to check with position key format
+    if position_side:
+        # Check for specific position side (symbol_LONG or symbol_SHORT)
+        position_key = f"{symbol}_{position_side}"
+        if position_key in open_positions:
+            return True, open_positions[position_key]
+    else:
+        # Check for any position in this symbol (either side)
+        for key, position in open_positions.items():
+            if position['symbol'] == symbol:
+                return True, position
+    
+    return False, None
 def place_tp_only_order(exchange, market_id, entry_side, quantity, leverage=10, retries=2):
     """
     Place a take-profit order with a fixed 20% price change profit target.
-    FIXED to ensure exactly 20% price change (not 2%).
+    Enhanced with proper hedge mode support.
     """
     try:
+        # FIXED: Strip position side suffix (_LONG or _SHORT) from market_id if present
+        if isinstance(market_id, str) and ('_LONG' in market_id or '_SHORT' in market_id):
+            # Extract the base symbol by removing the position side suffix
+            base_market_id = market_id.split('_')[0]
+            logger.info(f"Stripped position side suffix from market ID: {market_id} -> {base_market_id}")
+            market_id = base_market_id
+            
         # Get position information from exchange
         open_positions = fetch_open_positions(exchange)
         
+        # Look for the position using both the regular symbol and potential position-side-specific keys
+        position_info = None
         if market_id in open_positions:
             position_info = open_positions[market_id]
+        else:
+            # Try with position side suffixes if in hedge mode
+            if ENABLE_HEDGE_MODE:
+                long_key = f"{market_id}_LONG"
+                short_key = f"{market_id}_SHORT"
+                if entry_side == 'buy' and long_key in open_positions:
+                    position_info = open_positions[long_key]
+                elif entry_side == 'sell' and short_key in open_positions:
+                    position_info = open_positions[short_key]
+        
+        # Get entry price - from position or fallback to current price
+        if position_info:
             entry_price = position_info['entry_price']
         else:
             # Fallback if position not found
@@ -1604,19 +1950,17 @@ def place_tp_only_order(exchange, market_id, entry_side, quantity, leverage=10, 
             
         logger.info(f"Setting TP for {market_id} with entry price: {entry_price}")
         
-        # FIXED: Calculate target price with EXACTLY 20% price change
+        # Calculate target price with EXACTLY 20% price change
         if entry_side == 'buy':  # LONG
-            # For longs: Entry + 20% price change
-            target_price = entry_price * 1.20  # Fixed 20% price increase - VERIFIED
+            target_price = entry_price * 1.20  # Fixed 20% price increase
         else:  # SHORT
-            # For shorts: Entry - 20% price change
-            target_price = entry_price * 0.80  # Fixed 20% price decrease - VERIFIED
+            target_price = entry_price * 0.80  # Fixed 20% price decrease
         
-        # Ensure formatting is correct - often precision issues can cause problems
+        # Ensure formatting is correct
         formatted_entry = float(f"{entry_price:.6f}")
         formatted_target = float(f"{target_price:.6f}")
         
-        # Double-check the calculation to ensure it's really 20%
+        # Verify calculation
         if entry_side == 'buy':
             actual_pct = ((formatted_target - formatted_entry) / formatted_entry) * 100
         else:
@@ -1624,8 +1968,8 @@ def place_tp_only_order(exchange, market_id, entry_side, quantity, leverage=10, 
             
         logger.info(f"TP target for {market_id}: {formatted_target} ({actual_pct:.2f}% price change from entry {formatted_entry})")
         
-        # Sanity check - if the calculation is way off, log a warning
-        if abs(actual_pct - 20.0) > 0.5:  # Should be very close to 20%
+        # Sanity check
+        if abs(actual_pct - 20.0) > 0.5:
             logger.warning(f"TP calculation error! Target {actual_pct:.2f}% is not 20% from entry")
     
     except Exception as e:
@@ -1634,17 +1978,28 @@ def place_tp_only_order(exchange, market_id, entry_side, quantity, leverage=10, 
 
     # For TP orders, we want the opposite side of our entry
     inverted_side = 'sell' if entry_side == 'buy' else 'buy'
-
+    
     try:
-        # Place Take Profit order
+        # Set up TP order parameters
         tp_params = {
             'stopPrice': exchange.price_to_precision(market_id, target_price),
-            'reduceOnly': True,
             'timeInForce': 'GTE_GTC',
         }
         
+        # IMPORTANT: Handle reduceOnly vs positionSide properly
+        if ENABLE_HEDGE_MODE:
+            # In hedge mode, specify positionSide but NOT reduceOnly (they conflict)
+            positionSide = 'LONG' if entry_side == 'buy' else 'SHORT'
+            tp_params['positionSide'] = positionSide
+            # Do NOT add reduceOnly in hedge mode for TP orders
+            hedge_info = f" (positionSide: {positionSide})"
+        else:
+            # In one-way mode, use reduceOnly
+            tp_params['reduceOnly'] = True
+            hedge_info = ""
+        
         logger.info(f"Placing TP Order (EXACTLY 20% price change) for {market_id}: {inverted_side.upper()} "
-                   f"Qty:{quantity:.8f} @ Stop:{tp_params['stopPrice']}")
+                   f"Qty:{quantity:.8f} @ Stop:{tp_params['stopPrice']}{hedge_info}")
         
         tp_order = exchange.create_order(
             market_id, 'TAKE_PROFIT_MARKET', inverted_side, quantity, None, params=tp_params
@@ -1743,7 +2098,15 @@ def handle_position_reversal(exchange, symbol, reversal_strength, current_positi
         )
         
         # Place order for new position
-        order = place_order(exchange, symbol, new_entry_side, quantity, current_price, leverage)
+        order = place_order(
+            exchange, 
+            symbol, 
+            new_entry_side, 
+            quantity, 
+            current_price, 
+            leverage=leverage,
+            positionSide=new_position_type.upper()  # Specify new position type
+        )
         
         if not order:
             logger.error(f"Failed to execute reversal order for {symbol}")
@@ -1818,6 +2181,7 @@ def sync_positions_with_exchange(exchange):
 def momentum_trading_loop(exchange):
     """
     Enhanced momentum trading loop relying on exchange as the source of truth.
+    Modified to only count SHORT positions against MAX_OPEN_TRADES limit.
     """
     while True:
         try:
@@ -1833,9 +2197,14 @@ def momentum_trading_loop(exchange):
             # Check current positions after the above operations
             open_positions = fetch_open_positions(exchange)
             
-            # Check if we can look for new entries
-            if len(open_positions) >= MAX_OPEN_TRADES:
-                logger.info(f"At maximum number of open trades ({len(open_positions)}/{MAX_OPEN_TRADES}). Skipping new entries.")
+            # Count only SHORT positions for MAX_OPEN_TRADES check
+            short_positions = {key: pos for key, pos in open_positions.items() 
+                              if pos['position_type'] == 'short'}
+            
+            # Check if we can look for new SHORT entries
+            if len(short_positions) >= MAX_OPEN_TRADES:
+                logger.info(f"At maximum number of SHORT trades ({len(short_positions)}/{MAX_OPEN_TRADES}). "
+                           f"Skipping new SHORT entries. Total positions: {len(open_positions)}.")
                 time.sleep(SLEEP_INTERVAL * 3)
                 continue  # Skip to next loop iteration, don't look for new entries
             
@@ -1920,8 +2289,14 @@ def momentum_trading_loop(exchange):
                                  f"(crossunder was {crossunder_age} candles / {minutes_ago} minutes ago)")
                         
                         order = place_order(
-                            exchange, symbol, 'sell', quantity, current_price, leverage=leverage
-                        )
+                                exchange, 
+                                symbol, 
+                                'sell', 
+                                quantity, 
+                                current_price, 
+                                leverage=leverage,
+                                positionSide='SHORT'  # Explicitly set short position side
+                            )
                         
                         if order:
                             logger.info(f"Opened MOMENTUM SHORT position for {symbol}")
@@ -1941,9 +2316,14 @@ def momentum_trading_loop(exchange):
                             
                             entry_placed = True
                             
+                            # Refresh open positions and count only SHORT positions for limit check
                             open_positions = fetch_open_positions(exchange)
-                            if len(open_positions) >= MAX_OPEN_TRADES:
-                                logger.info(f"Reached maximum number of open trades ({len(open_positions)}/{MAX_OPEN_TRADES}). Stopping entry processing.")
+                            short_positions = {key: pos for key, pos in open_positions.items() 
+                                              if pos['position_type'] == 'short'}
+                            
+                            if len(short_positions) >= MAX_OPEN_TRADES:
+                                logger.info(f"Reached maximum number of SHORT trades ({len(short_positions)}/{MAX_OPEN_TRADES}). "
+                                          f"Stopping entry processing.")
                                 break
                             
                             break
@@ -1961,8 +2341,9 @@ def momentum_trading_loop(exchange):
                 except Exception as e:
                     logger.exception(f"Error processing momentum short for {symbol}: {e}")
             
-            # Process long candidates if we still have room for trades
-            if not entry_placed and len(open_positions) < MAX_OPEN_TRADES:
+            # Process long candidates without checking MAX_OPEN_TRADES limit
+            # We allow unlimited LONG positions now
+            if not entry_placed:  # Only try LONG entries if no SHORT entries were placed
                 # For now, we'll check for long signals in the stored signals
                 long_signals = {s: sig for s, sig in stored_signals.items() 
                                if sig['signal'] == 'buy' and s not in open_positions}
@@ -1996,8 +2377,14 @@ def momentum_trading_loop(exchange):
                                 pyramid_details[symbol] = {'count': 0, 'entries': []}
                                 
                             order = place_order(
-                                exchange, symbol, 'buy', quantity, current_price, leverage=leverage
-                            )
+                                        exchange, 
+                                        symbol, 
+                                        'buy', 
+                                        quantity, 
+                                        current_price, 
+                                        leverage=leverage,
+                                        positionSide='LONG'  # Explicitly set long position side
+                                    )
                             
                             if order:
                                 logger.info(f"Opened MOMENTUM LONG position for {symbol}")
@@ -2048,6 +2435,10 @@ def main():
     # Update configuration constants for minimum hold time
     global MINIMUM_HOLD_MINUTES
     MINIMUM_HOLD_MINUTES = 2  # Minimum 2 minutes hold time
+    
+    # Log updated trading settings
+    logger.info(f"Starting momentum trading bot with MAX_OPEN_TRADES={MAX_OPEN_TRADES} (SHORT positions only)")
+    logger.info(f"LONG positions will not count against the MAX_OPEN_TRADES limit")
     
     # Recovery mode - check for any missed exits
     sync_positions_with_exchange(exchange)
