@@ -553,27 +553,44 @@ def fetch_open_positions(exchange):
 def check_for_pyramid_opportunity(exchange, symbol):
     """
     Check if we should add to an existing position via pyramiding.
-    Enforces a minimum 2% price change between pyramid entries.
+    FIXED: Now properly handles hedge mode where positions have _LONG/_SHORT suffixes.
     """
     try:
         # Get open positions directly from exchange
         open_positions = fetch_open_positions(exchange)
         
-        # Skip if position doesn't exist on exchange
-        if symbol not in open_positions:
+        # FIXED: Handle hedge mode position key lookup
+        position_key = symbol
+        position_info = None
+        
+        if ENABLE_HEDGE_MODE:
+            # In hedge mode, positions have _LONG or _SHORT suffixes
+            long_key = f"{symbol}_LONG"
+            short_key = f"{symbol}_SHORT"
+            
+            if long_key in open_positions:
+                position_key = long_key
+                position_info = open_positions[long_key]
+            elif short_key in open_positions:
+                position_key = short_key
+                position_info = open_positions[short_key]
+        else:
+            # In one-way mode, use plain symbol
+            if symbol in open_positions:
+                position_info = open_positions[symbol]
+        
+        # Skip if no position found
+        if position_info is None:
             return False, 0, "No active position"
-
-        # Get position info directly from exchange data
-        position_info = open_positions[symbol]
+        
+        # Get position details
         position_type = position_info['position_type']
         entry_price = position_info['entry_price'] 
         current_total_size = position_info['position_size_usd']
         leverage = position_info['leverage']
         current_price = position_info['current_price']
-        
-        # Get pyramid details from our tracking
-        pyramid_count = position_info['pyramid_count']
         pyramid_entries = position_info['pyramid_entries']
+        pyramid_count = position_info['pyramid_count']
 
         # Check if we've reached maximum pyramid entries
         if pyramid_count >= PYRAMID_CONFIG['max_entries']:
@@ -581,72 +598,272 @@ def check_for_pyramid_opportunity(exchange, symbol):
         
         # Check if position already at max size
         if current_total_size >= MAX_AMOUNT_USD:
-            #logger.info(f"Cannot pyramid {symbol}: Position size ${current_total_size:.2f} already at or exceeds max ${MAX_AMOUNT_USD:.2f}")
             return False, 0, f"Position already at maximum size (${current_total_size:.2f})"
-        # Check if we're already very close to max size (within 0.5 USD or 90%, whichever is smaller)
-        threshold = min(0.5, MAX_AMOUNT_USD * 0.1)  # Either $0.5 or 10% of max, whichever is smaller
+            
+        # Check if we're already very close to max size
+        threshold = min(0.5, MAX_AMOUNT_USD * 0.1)
         if (MAX_AMOUNT_USD - current_total_size) <= threshold:
-            logger.info(f"Position size ${current_total_size:.2f} is already close enough to maximum ${MAX_AMOUNT_USD:.2f}. Considering pyramid complete.")
             return False, 0, f"Position already effectively at maximum size (${current_total_size:.2f})"
+            
         # Get the previous pyramid level price or use original entry price
         if pyramid_entries and len(pyramid_entries) > 0:
             previous_level_price = pyramid_entries[-1].get('price', entry_price)
         else:
             previous_level_price = entry_price
             
-        # Calculate the absolute price change since previous entry
-        price_change_pct = 0
+        # Calculate dynamic pyramid threshold (simplified to 2%)
+        pyramid_threshold = 2.0  # Fixed 2% threshold
         
         if position_type == 'short':
-            # For SHORT, we need price to move down by at least 2% from previous level
+            # For SHORT, check if price moved down 2% from previous level
             price_change_pct = ((previous_level_price - current_price) / previous_level_price) * 100
-            # Check if price has moved enough (minimum 2% price decrease)
-            if price_change_pct < 2.0:
-                return False, 0, f"Insufficient price decrease for pyramid ({price_change_pct:.2f}% < 2.0%)"
+            if price_change_pct < pyramid_threshold:
+                return False, 0, f"Price decrease {price_change_pct:.2f}% < threshold {pyramid_threshold:.2f}%"
                 
-            # Calculate whether price has moved enough to warrant a new pyramid level
-            next_target_price = previous_level_price * 0.98  # 2% lower than previous entry
-            
-            # Only pyramid if price is at or below the target price
-            if current_price > next_target_price:
-                return False, 0, f"Current price ({current_price:.6f}) above target ({next_target_price:.6f}) for next pyramid level"
-                
-            # We've passed the checks, proceed with pyramid entry
-            reason = f"Short Pyramid Level {pyramid_count + 1}: Price {current_price:.6f} <= Target {next_target_price:.6f} " 
-            reason += f"(Price decrease: {price_change_pct:.2f}% >= Required: 2.00%)"
+            reason = f"Short Pyramid Level {pyramid_count + 1}: Price decrease {price_change_pct:.2f}%"
                 
         elif position_type == 'long':
-            # For LONG, we need price to move up by at least 2% from previous level
+            # For LONG, check if price moved up 2% from previous level
             price_change_pct = ((current_price - previous_level_price) / previous_level_price) * 100
-            # Check if price has moved enough (minimum 2% price increase)
-            if price_change_pct < 2.0:
-                return False, 0, f"Insufficient price increase for pyramid ({price_change_pct:.2f}% < 2.0%)"
+            if price_change_pct < pyramid_threshold:
+                return False, 0, f"Price increase {price_change_pct:.2f}% < threshold {pyramid_threshold:.2f}%"
                 
-            # Calculate whether price has moved enough to warrant a new pyramid level
-            next_target_price = previous_level_price * 1.02  # 2% higher than previous entry
-            
-            # Only pyramid if price is at or above the target price
-            if current_price < next_target_price:
-                return False, 0, f"Current price ({current_price:.6f}) below target ({next_target_price:.6f}) for next pyramid level"
-                
-            # We've passed the checks, proceed with pyramid entry
-            reason = f"Long Pyramid Level {pyramid_count + 1}: Price {current_price:.6f} >= Target {next_target_price:.6f} " 
-            reason += f"(Price increase: {price_change_pct:.2f}% >= Required: 2.00%)"
+            reason = f"Long Pyramid Level {pyramid_count + 1}: Price increase {price_change_pct:.2f}%"
         else:
             return False, 0, f"Unknown position type '{position_type}'"
 
-        # Always use fixed AMOUNT_INCREMENT for each pyramid
-        size_to_add = AMOUNT_INCREMENT
+        # Calculate pyramid size: Pₙ = P₀ × 0.5^n
+        initial_size = BASE_AMOUNT_USD
+        size_to_add = calculate_pyramid_size(initial_size, pyramid_count)
         
         # Ensure we don't exceed max size
         capped_add_size = max(0.0, min(size_to_add, MAX_AMOUNT_USD - current_total_size))
+        
+        # If addition too small, skip
+        if capped_add_size < 0.5:
+            return False, 0, f"Calculated pyramid size (${capped_add_size:.2f}) too small"
+            
+        reason += f", Adding: ${capped_add_size:.2f}"
         
         return True, capped_add_size, reason
 
     except Exception as e:
         logger.error(f"Error checking pyramid opportunity for {symbol}: {e}", exc_info=True)
         return False, 0, f"Error: {str(e)}"
-
+def calculate_risk_optimized_tp(exchange, symbol, position_type, entry_price, stop_loss):
+    """
+    Calculate take-profit level ensuring minimum risk-reward ratio of 2:1.
+    With additional validation and logging.
+    """
+    try:
+        # Safety check for invalid inputs
+        if entry_price <= 0 or stop_loss <= 0:
+            logger.error(f"Invalid entry_price ({entry_price}) or stop_loss ({stop_loss}) for {symbol}")
+            return entry_price * (1.2 if position_type == 'long' else 0.8)  # Fallback to 20%
+            
+        # Calculate risk
+        if position_type == 'long':
+            if stop_loss >= entry_price:
+                logger.error(f"Stop loss ({stop_loss}) above entry price ({entry_price}) for LONG position")
+                stop_loss = entry_price * 0.94  # Fallback to 6% below entry
+                
+            risk = entry_price - stop_loss
+            # Target should be at least 2x risk above entry (framework rule)
+            min_reward = risk * 2
+            target_price = entry_price + min_reward
+        else:  # short
+            if stop_loss <= entry_price:
+                logger.error(f"Stop loss ({stop_loss}) below entry price ({entry_price}) for SHORT position")
+                stop_loss = entry_price * 1.06  # Fallback to 6% above entry
+                
+            risk = stop_loss - entry_price
+            # Target should be at least 2x risk below entry (framework rule)
+            min_reward = risk * 2
+            target_price = entry_price - min_reward
+        
+        # Log base calculation
+        logger.info(f"Base TP calculation for {symbol} {position_type}: Entry {entry_price:.6f}, Stop {stop_loss:.6f}, " +
+                   f"Risk {risk:.6f}, Min Reward {min_reward:.6f}, Base Target {target_price:.6f}")
+        
+        # Calculate dynamic TP based on price change
+        df = fetch_extended_historical_data(exchange, symbol, TIMEFRAME)
+        if df is None or len(df) < 20:
+            # If no dynamic calculation possible, use the minimum risk-reward TP
+            logger.info(f"Using base risk-reward TP for {symbol}: {target_price:.6f}")
+            return target_price
+            
+        # Calculate recent price change percentage (last 24 hours)
+        candle_count = min(480, len(df) - 1)
+        start_price = df['close'].iloc[-candle_count]
+        end_price = df['close'].iloc[-1]
+        
+        # Calculate absolute percentage change
+        price_change_24h_pct = abs((end_price - start_price) / start_price) * 100
+        
+        # Calculate volatility-based TP percentage
+        tp_pct = price_change_24h_pct * 1.5
+        
+        # Clamp TP percentage between 5% and 30%
+        tp_pct = max(5.0, min(30.0, tp_pct))
+        
+        # Calculate price-based target
+        dynamic_target = entry_price * (1 + tp_pct/100) if position_type == 'long' else entry_price * (1 - tp_pct/100)
+        
+        # Log dynamic calculation
+        logger.info(f"Dynamic TP calculation for {symbol}: 24h Change {price_change_24h_pct:.2f}%, " +
+                   f"TP% {tp_pct:.2f}%, Dynamic Target {dynamic_target:.6f}")
+        
+        # Use the target that gives better reward while maintaining minimum risk-reward
+        if position_type == 'long':
+            # For longs, use the farther target (higher price)
+            final_target = max(target_price, dynamic_target)
+        else:  # short
+            # For shorts, use the farther target (lower price)
+            final_target = min(target_price, dynamic_target)
+        
+        # Calculate actual risk-reward ratio for logging
+        if position_type == 'long':
+            actual_reward = final_target - entry_price
+            actual_ratio = actual_reward / risk if risk > 0 else 0
+        else:
+            actual_reward = entry_price - final_target
+            actual_ratio = actual_reward / risk if risk > 0 else 0
+            
+        logger.info(f"Final TP calculation for {symbol}: Risk ${risk:.6f}, Reward ${actual_reward:.6f}, " 
+                   f"Ratio {actual_ratio:.2f}, Target {final_target:.6f}")
+        
+        # Verify target is reasonable (not too far from current price)
+        current_price = df['close'].iloc[-1]
+        if position_type == 'long' and final_target > current_price * 1.5:
+            logger.warning(f"TP target for {symbol} LONG seems excessive: {final_target:.6f} (50%+ above current price {current_price:.6f})")
+        elif position_type == 'short' and final_target < current_price * 0.5:
+            logger.warning(f"TP target for {symbol} SHORT seems excessive: {final_target:.6f} (50%+ below current price {current_price:.6f})")
+        
+        return final_target
+        
+    except Exception as e:
+        logger.error(f"Error calculating risk-optimized TP: {e}")
+        # Default to 20% profit target as fallback
+        return entry_price * (1.2 if position_type == 'long' else 0.8)
+    
+def check_for_hedge_opportunity(exchange, symbol, position_info):
+    """
+    Check if we should hedge a position based on 3% retracement from low.
+    Hedge size Hₙ = Current Position Exposure / 2
+    """
+    try:
+        position_type = position_info['position_type']
+        entry_price = position_info['entry_price']
+        current_price = position_info['current_price']
+        current_exposure = position_info['position_size_usd']
+        entry_time = position_info['entry_time']
+        
+        # Skip if no valid entry time
+        if not entry_time or entry_time <= 0:
+            return False, 0, "No valid entry time"
+        
+        # Skip if current exposure exceeds MAX_AMOUNT_USD
+        if current_exposure >= MAX_AMOUNT_USD:
+            return False, 0, f"Position already at maximum size (${current_exposure:.2f})"
+        
+        # Get historical data since entry
+        df = fetch_extended_historical_data(exchange, symbol, TIMEFRAME)
+        if df is None or len(df) < 5:
+            return False, 0, "Insufficient historical data"
+        
+        # Filter data since entry
+        entry_timestamp = pd.Timestamp(entry_time, unit='s', tz='UTC')
+        df_since_entry = df[df.index > entry_timestamp]
+        
+        if len(df_since_entry) < 3:
+            return False, 0, "Insufficient data since entry"
+        
+        # Calculate retracement from low (for SHORT positions)
+        if position_type == 'short':
+            lowest_price = df_since_entry['low'].min()
+            retracement_pct = ((current_price - lowest_price) / lowest_price) * 100
+        else:
+            # For LONG positions, calculate retracement from high
+            highest_price = df_since_entry['high'].max()
+            retracement_pct = ((highest_price - current_price) / highest_price) * 100
+        
+        # Check if retracement meets 3% threshold
+        if retracement_pct < 3.0:
+            return False, 0, f"Retracement ({retracement_pct:.2f}%) below 3% threshold"
+        
+        # Check for existing hedges
+        all_positions = fetch_open_positions(exchange)
+        opposite_side = 'LONG' if position_type == 'short' else 'SHORT'
+        
+        hedge_count = 0
+        for pos_key, pos in all_positions.items():
+            if pos['symbol'] == symbol and pos['position_type'] != position_type:
+                hedge_count += 1
+        
+        # Skip if maximum hedge count reached
+        if hedge_count >= 3:
+            return False, 0, "Maximum hedge count reached"
+        
+        # Calculate hedge size: Hₙ = Current Exposure / 2
+        hedge_size = current_exposure / 2
+        
+        # Ensure hedge size respects MAX_AMOUNT_USD
+        total_exposure = sum(pos['position_size_usd'] for pos in all_positions.values() if pos['symbol'] == symbol)
+        if total_exposure + hedge_size > MAX_AMOUNT_USD:
+            hedge_size = max(0, MAX_AMOUNT_USD - total_exposure)
+        
+        # Ensure minimum viable hedge size
+        if hedge_size < BASE_AMOUNT_USD / 2:
+            return False, 0, f"Calculated hedge size (${hedge_size:.2f}) too small"
+        
+        reason = f"{position_type.capitalize()} Hedge: {retracement_pct:.2f}% retracement from {'low' if position_type == 'short' else 'high'} since entry, Hedge size ${hedge_size:.2f}"
+        
+        return True, hedge_size, reason
+        
+    except Exception as e:
+        logger.error(f"Error checking hedge opportunity for {symbol}: {e}")
+        return False, 0, f"Error: {str(e)}"
+def calculate_dynamic_hedge_size(exchange, symbol, position_type, current_exposure):
+    """Calculate hedge size based on retracement severity and speed."""
+    try:
+        # Get recent price data
+        df = fetch_extended_historical_data(exchange, symbol, TIMEFRAME)
+        if df is None or len(df) < 20:
+            return BASE_AMOUNT_USD  # Default size if insufficient data
+            
+        # Calculate retracement percentage
+        recent_candles = min(10, len(df) - 1)
+        price_series = df['close'].iloc[-recent_candles:].values
+        
+        if position_type == 'short':
+            # For shorts, we're concerned with price increases
+            lowest = np.min(price_series[:-1])  # Exclude current price
+            current = price_series[-1]
+            retracement_pct = ((current - lowest) / lowest) * 100 if lowest > 0 else 0
+        else:  # long
+            # For longs, we're concerned with price decreases
+            highest = np.max(price_series[:-1])  # Exclude current price
+            current = price_series[-1]
+            retracement_pct = ((highest - current) / highest) * 100 if highest > 0 else 0
+        
+        # Calculate time to retrace (in minutes)
+        # Assuming 3-min candles, estimate conservatively
+        time_to_retrace = recent_candles * 3  # 3 minutes per candle for 3m timeframe
+        
+        # Calculate hedge ratio using the formula
+        # H_n = (E/2) × (1 + R/T)
+        hedge_ratio = (1 + (retracement_pct / max(1, time_to_retrace)))
+        hedge_size = (current_exposure / 2) * hedge_ratio
+        
+        # Clamp hedge size between 1x and 3x of BASE_AMOUNT_USD
+        min_hedge = BASE_AMOUNT_USD
+        max_hedge = BASE_AMOUNT_USD * 3
+        
+        return max(min_hedge, min(max_hedge, hedge_size))
+        
+    except Exception as e:
+        logger.error(f"Error calculating dynamic hedge size: {e}")
+        return BASE_AMOUNT_USD  # Default to base amount on error
 def check_for_pyramid_entries(exchange):
     """
     Check for pyramid entry opportunities in open positions.
@@ -659,8 +876,13 @@ def check_for_pyramid_entries(exchange):
         if not open_positions:
             return
 
-        for symbol in open_positions.keys():
+        for position_key in open_positions.keys():
             try:
+                # CRITICAL FIX: Extract the base symbol without position side suffix
+                symbol = position_key
+                if '_LONG' in position_key or '_SHORT' in position_key:
+                    symbol = position_key.split('_')[0]
+                
                 # Check if we can pyramid this position
                 should_pyramid, size_to_add, reason = check_for_pyramid_opportunity(exchange, symbol)
 
@@ -668,7 +890,7 @@ def check_for_pyramid_entries(exchange):
                     continue # Skip to next symbol
 
                 # Get position details directly from exchange data
-                position_info = open_positions[symbol]
+                position_info = open_positions[position_key]
                 position_type = position_info['position_type']
                 leverage = position_info['leverage']
                 current_price = position_info['current_price']
@@ -688,15 +910,17 @@ def check_for_pyramid_entries(exchange):
                 logger.info(f"Current position size: ${position_info['position_size_usd']:.2f}, Adding: ${size_to_add:.2f} (Qty: {quantity:.8f})")
 
                 # Place the pyramid order (adds to the existing position)
+                # Pass clean symbol and explicit position side
                 pyramid_order = place_order(
                     exchange,
-                    symbol,
+                    symbol,  # Clean symbol without suffix
                     entry_side,
                     quantity,
                     current_price,
                     leverage=leverage,
                     positionSide=position_type.upper()  # Explicitly set position side based on position type
                 )
+                
                 if pyramid_order:
                     # Use executed price if available, otherwise market price estimate
                     executed_price = pyramid_order.get('average', current_price) if pyramid_order.get('average') else current_price
@@ -704,12 +928,12 @@ def check_for_pyramid_entries(exchange):
 
                     # Update pyramid tracking count and entry details
                     with pyramid_lock:
-                        if symbol not in pyramid_details:
-                            pyramid_details[symbol] = {'count': 0, 'entries': []}
+                        if position_key not in pyramid_details:
+                            pyramid_details[position_key] = {'count': 0, 'entries': []}
 
                         # Add the new entry info
-                        pyramid_details[symbol]['count'] += 1
-                        pyramid_details[symbol]['entries'].append({
+                        pyramid_details[position_key]['count'] += 1
+                        pyramid_details[position_key]['entries'].append({
                             'price': executed_price,
                             'added_size_usd': size_to_add,
                             'quantity': quantity,
@@ -717,23 +941,135 @@ def check_for_pyramid_entries(exchange):
                         })
 
                 else:
-                    logger.error(f"Failed to place pyramid add order for {symbol}")
+                    logger.error(f"Failed to place pyramid add order for {position_key}")
 
             except Exception as e:
-                logger.exception(f"Error checking/placing pyramid entry for {symbol}: {e}")
+                logger.exception(f"Error checking/placing pyramid entry for {position_key}: {e}")
                 continue
 
     except Exception as e:
         logger.exception(f"Error in check_for_pyramid_entries main loop: {e}")
+def calculate_adjustment_factor(exchange, symbol, position_type):
+    """Calculate position size adjustment factor based on trend strength."""
+    try:
+        # Get price data
+        df = fetch_extended_historical_data(exchange, symbol, MOMENTUM_TIMEFRAME)
+        if df is None or len(df) < 20:
+            return 1.0  # Default factor if insufficient data
+            
+        # Calculate momentum score (0-10 scale)
+        recent_candles = 20
+        closes = df['close'].iloc[-recent_candles:].values
+        
+        # Calculate price change direction in recent candles
+        direction_changes = np.diff(np.sign(np.diff(closes)))
+        streak_length = 0
+        for i in range(len(direction_changes) - 1, -1, -1):
+            if direction_changes[i] == 0:  # No direction change
+                streak_length += 1
+            else:
+                break
+                
+        # Calculate momentum score based on streak and volatility
+        momentum_score = min(10, streak_length / 2)
+        
+        # If price making new highs/lows, increase the factor
+        if position_type == 'long' and closes[-1] > np.max(closes[:-1]):
+            adjustment_factor = 1 + (momentum_score / 10)
+        elif position_type == 'short' and closes[-1] < np.min(closes[:-1]):
+            adjustment_factor = 1 + (momentum_score / 10)
+        else:
+            # Calculate retracement severity (0-10 scale)
+            if position_type == 'long':
+                highest = np.max(closes)
+                retracement_pct = ((highest - closes[-1]) / highest) * 100
+            else:  # short
+                lowest = np.min(closes)
+                retracement_pct = ((closes[-1] - lowest) / lowest) * 100
+                
+            reversal_severity = min(10, retracement_pct * 2)
+            adjustment_factor = 1 - (reversal_severity / 10)
+            
+        return max(0.5, min(2.0, adjustment_factor))  # Clamp between 0.5 and 2.0
+        
+    except Exception as e:
+        logger.error(f"Error calculating adjustment factor: {e}")
+        return 1.0  # Default to neutral factor on error
+def calculate_pyramid_size(initial_size, pyramid_count):
+    """
+    Calculate pyramid size based on the formula: Pₙ = Pₙ₋₁ × 0.5
+    
+    Args:
+        initial_size: Initial position size (P₀)
+        pyramid_count: Current pyramid count (n)
+        
+    Returns:
+        float: Size for the next pyramid addition
+    """
+    return initial_size * (0.5 ** pyramid_count)
 
+def calculate_hedge_size(current_exposure, hedge_count, remaining_exposure=None):
+    """
+    Calculate hedge size based on the sequence:
+    H₁ = Current Exposure / 2
+    H₂ = Remaining Exposure / 2
+    H₃ = Full Flip
+    
+    Args:
+        current_exposure: Current position exposure
+        hedge_count: Current hedge count (1, 2, or 3)
+        remaining_exposure: Exposure after previous hedges (required for hedge_count > 1)
+        
+    Returns:
+        float: Size for the next hedge
+    """
+    if hedge_count == 1:
+        return min(current_exposure / 2, MAX_AMOUNT_USD)
+    elif hedge_count == 2:
+        if remaining_exposure is None:
+            raise ValueError("remaining_exposure must be provided for hedge_count > 1")
+        return min(remaining_exposure / 2, MAX_AMOUNT_USD)
+    elif hedge_count == 3:
+        # Full flip - close remaining and open opposite direction with equal size
+        if remaining_exposure is None:
+            raise ValueError("remaining_exposure must be provided for hedge_count > 1")
+        return remaining_exposure  # Full remaining exposure
+    else:
+        raise ValueError(f"Invalid hedge_count: {hedge_count}. Must be 1, 2, or 3.")
+def check_risk_reward_ratio(entry_price, stop_loss, target_price, position_type, min_ratio=2.0):
+    """
+    Check if the risk-reward ratio meets the minimum requirement: Target Reward ≥ min_ratio × Risk
+    
+    Args:
+        entry_price: Position entry price
+        stop_loss: Stop loss price
+        target_price: Target price for taking profit
+        position_type: 'long' or 'short'
+        min_ratio: Minimum risk-reward ratio (default: 2.0)
+        
+    Returns:
+        tuple: (meets_requirement, actual_ratio)
+    """
+    if position_type == 'long':
+        reward = target_price - entry_price
+        risk = entry_price - stop_loss
+    else:  # short
+        reward = entry_price - target_price
+        risk = stop_loss - entry_price
+        
+    # Avoid division by zero
+    if risk <= 0:
+        return False, 0.0
+        
+    actual_ratio = reward / risk
+    meets_requirement = actual_ratio >= min_ratio
+    
+    return meets_requirement, actual_ratio
+    
 def check_for_position_exits(exchange):
     """
-    Enhanced position management that strictly follows 2% rules:
-    - Increase long when price goes up by 2% from entry
-    - Decrease long when price drops 2% from any high
-    - Increase short when price goes down by 2% from entry  
-    - Decrease short when price rises 2% from any low
-    Uses only exchange-reported data, not local storage.
+    Enhanced position management with 3% retracement reduction logic.
+    FIXED: Now properly sets reduceOnly=True for position reductions.
     """
     try:
         # Get open positions directly from exchange
@@ -742,8 +1078,6 @@ def check_for_position_exits(exchange):
         if not open_positions:
             return
             
-        logger.info(f"Checking {len(open_positions)} open positions for management")
-        
         for position_key, position_info in open_positions.items():
             try:
                 # Get position details from exchange data
@@ -752,452 +1086,163 @@ def check_for_position_exits(exchange):
                 position_side = position_info.get('position_side', 'BOTH')
                 entry_price = position_info['entry_price']
                 current_price = position_info['current_price']
-                max_profit_pct = position_info['max_profit_pct']  # From exchange
                 quantity = position_info['quantity']
                 position_size_usd = position_info['position_size_usd']
                 leverage = position_info['leverage']
                 entry_time = position_info['entry_time']
                 
                 # --- 8% MAX LOSS EXIT LOGIC ---
-                # Calculate the raw price change percentage (without leverage)
                 if position_type == 'short':
                     price_change_pct = ((current_price - entry_price) / entry_price) * 100
-                    unfavorable_move = price_change_pct > 0  # Price increased from entry
-                else:  # 'long'
+                    unfavorable_move = price_change_pct > 0
+                else:
                     price_change_pct = ((entry_price - current_price) / entry_price) * 100
-                    unfavorable_move = price_change_pct > 0  # Price decreased from entry
+                    unfavorable_move = price_change_pct > 0
                 
-                # Check if we need to exit due to 8% price change
-                MAX_PRICE_CHANGE_PCT = 8.0  # 8% max allowed price change
+                MAX_PRICE_CHANGE_PCT = 8.0
                 
-                # If price has moved unfavorably by 8% or more, exit the position
                 if unfavorable_move and abs(price_change_pct) >= MAX_PRICE_CHANGE_PCT:
-                    # Determine exit side (opposite of position)
                     exit_side = 'buy' if position_type == 'short' else 'sell'
                     
                     logger.info(f"MAX PRICE CHANGE EXIT: {symbol} {position_type.upper()} - " +
-                              f"Price moved {price_change_pct:.2f}% against entry. " +
-                              f"Current: {current_price:.6f}, Entry: {entry_price:.6f}")
+                              f"Price moved {price_change_pct:.2f}% against entry.")
                     
-                    # Place reduce-only order to close the entire position
+                    # FIXED: Use reduceOnly=True for closing positions
                     exit_order = place_order(
-                        exchange, 
-                        symbol, 
-                        exit_side, 
-                        quantity, 
-                        current_price,
-                        reduceOnly=False, 
-                        positionSide=position_side if ENABLE_HEDGE_MODE else None
+                        exchange, symbol, exit_side, quantity, current_price,
+                        reduceOnly=True, positionSide=position_side if ENABLE_HEDGE_MODE else None
                     )
                     
                     if exit_order:
-                        logger.info(f"Successfully closed {symbol} {position_type.upper()} position due to 8% price change." +
-                                  f" Raw price change: {price_change_pct:.2f}%, P/L: {position_info['current_profit_pct']:.2f}%")
+                        logger.info(f"Successfully closed {symbol} {position_type.upper()} position due to 8% price change.")
+                        record_trade_result(symbol, entry_price, current_price, position_type, entry_time, leverage=leverage)
+                        continue
+                
+                # --- 3% RETRACEMENT REDUCTION LOGIC ---
+                if not entry_time or entry_time <= 0:
+                    logger.warning(f"No valid entry time for {symbol}. Skipping retracement check.")
+                    continue
+                
+                # Get historical data since entry
+                df = fetch_extended_historical_data(exchange, symbol, TIMEFRAME)
+                if df is None or len(df) < 5:
+                    logger.debug(f"Insufficient historical data for {symbol} retracement check")
+                    continue
+                
+                # Filter data to only include candles AFTER entry time
+                entry_timestamp = pd.Timestamp(entry_time, unit='s', tz='UTC')
+                df_since_entry = df[df.index > entry_timestamp]
+                
+                if len(df_since_entry) < 3:  # Need some data after entry
+                    logger.debug(f"Insufficient data since entry for {symbol}")
+                    continue
+                
+                # Calculate retracement based on position type
+                reduce_position = False
+                reduction_reason = ""
+                
+                if position_type == 'short':
+                    # For SHORT: Find lowest price since entry
+                    lowest_price = df_since_entry['low'].min()
+                    
+                    # Calculate 3% above the low
+                    retracement_threshold = lowest_price * 1.03
+                    
+                    # Current retracement percentage
+                    retracement_pct = ((current_price - lowest_price) / lowest_price) * 100
+                    
+                    # Check if current price is above threshold (3% retracement)
+                    if current_price >= retracement_threshold and retracement_pct >= 3.0:
+                        reduce_position = True
+                        reduction_reason = f"Price {current_price:.6f} retraced {retracement_pct:.2f}% from low {lowest_price:.6f}"
+                
+                elif position_type == 'long':
+                    # For LONG: Find highest price since entry
+                    highest_price = df_since_entry['high'].max()
+                    
+                    # Calculate 3% below the high
+                    retracement_threshold = highest_price * 0.97
+                    
+                    # Current retracement percentage
+                    retracement_pct = ((highest_price - current_price) / highest_price) * 100
+                    
+                    # Check if current price is below threshold (3% retracement)
+                    if current_price <= retracement_threshold and retracement_pct >= 3.0:
+                        reduce_position = True
+                        reduction_reason = f"Price {current_price:.6f} retraced {retracement_pct:.2f}% from high {highest_price:.6f}"
+                
+                # Execute reduction if needed
+                if reduce_position and position_size_usd > BASE_AMOUNT_USD/2:
+                    # Check if position size is around $1 - if so, exit completely
+                    if 0.9 <= position_size_usd <= 1.1:
+                        logger.info(f"CLOSING ENTIRE {position_type.upper()} {symbol}: Position size ${position_size_usd:.2f} is around $1. {reduction_reason}")
                         
-                        # Record trade result
-                        record_trade_result(
-                            symbol, entry_price, current_price, position_type, 
-                            entry_time, leverage=leverage
+                        exit_side = 'buy' if position_type == 'short' else 'sell'
+                        # FIXED: Use reduceOnly=True for closing positions
+                        close_order = place_order(
+                            exchange, symbol, exit_side, quantity, current_price,
+                            reduceOnly=True, positionSide=position_side if ENABLE_HEDGE_MODE else None
                         )
                         
-                        # Clean up tracking data
-                        with pyramid_lock:
-                            if position_key in pyramid_details: del pyramid_details[position_key]
-                        with max_profit_lock:
-                            if position_key in max_profit_tracking: del max_profit_tracking[position_key]
-                        with cooldown_lock:
-                            if position_key in position_entry_times: del position_entry_times[position_key]
-                        
-                        # Set cooldown after exit
-                        with cooldown_lock:
-                            cooldown_end_time = time.time() + (SYMBOL_COOLDOWN_MINUTES * 60)
-                            symbol_cooldowns[symbol] = cooldown_end_time
-                            logger.info(f"Initiated {SYMBOL_COOLDOWN_MINUTES} min cooldown for {symbol}")
-                        
-                        # Skip to next position
-                        continue
+                        if close_order:
+                            logger.info(f"SUCCESS: Closed entire {position_type.upper()} {symbol} position (${position_size_usd:.2f})")
+                            record_trade_result(symbol, entry_price, current_price, position_type, entry_time, leverage=leverage)
+                            continue
                     else:
-                        logger.error(f"Failed to place 8% max price change exit order for {symbol}")
-                
-                # --- POSITION INCREASE/DECREASE BASED ON 2% RULES ---
-                # Calculate the raw price change from entry (regardless of leverage)
-                from_entry_pct = 0
-                direction = ""
-                
-                if position_type == 'long':
-                    # For longs: price going up is favorable
-                    from_entry_pct = ((current_price - entry_price) / entry_price) * 100
-                    direction = "up" if from_entry_pct > 0 else "down"
-                else:  # short
-                    # For shorts: price going down is favorable
-                    from_entry_pct = ((entry_price - current_price) / entry_price) * 100
-                    direction = "down" if from_entry_pct > 0 else "up"
-                
-                # Log price movement from entry
-                # logger.info(f"Position {symbol} {position_type.upper()}: Price {direction} {abs(from_entry_pct):.2f}% from entry")
-                
-                # --- POSITION PYRAMID/INCREASE LOGIC ---
-                # Check if position should be increased based on 2% rule from entry
-                INCREASE_THRESHOLD_PCT = 2.0  # 2% favorable move to increase
-                
-                # Only consider increasing if price moved favorably by 2% or more from entry
-                if from_entry_pct >= INCREASE_THRESHOLD_PCT:
-                    # Check if we can add to position (under MAX_AMOUNT_USD)
-                    if position_size_usd < MAX_AMOUNT_USD:
-                        # Determine how much to add (BASE_AMOUNT_USD or to max)
-                        increase_size_usd = AMOUNT_INCREMENT
+                        # Reduce by BASE_AMOUNT_USD
+                        logger.info(f"REDUCING {position_type.upper()} {symbol}: {reduction_reason}")
                         
-                        if increase_size_usd > 0:
-                            logger.info(f"INCREASING {position_type.upper()} {symbol}: Price moved favorably {from_entry_pct:.2f}% from entry")
-                            
-                            # Calculate quantity to add
-                            increase_qty = get_order_quantity(
-                                exchange, symbol, current_price, leverage, increase_size_usd
-                            )
-                            
-                            # Determine order side based on position type
-                            increase_side = 'buy' if position_type == 'long' else 'sell'
-                            
-                            # Place the increase order
-                            increase_order = place_order(
-                                exchange,
-                                symbol,
-                                increase_side,
-                                increase_qty,
-                                current_price,
-                                leverage=leverage,
-                                positionSide=position_side if ENABLE_HEDGE_MODE else None
-                            )
-                            
-                            if increase_order:
-                                logger.info(f"Successfully increased {position_type.upper()} position for {symbol} by ${increase_size_usd:.2f}")
-                                
-                                # Update pyramid tracking
-                                with pyramid_lock:
-                                    if position_key not in pyramid_details:
-                                        pyramid_details[position_key] = {'count': 0, 'entries': []}
-                                    
-                                    pyramid_details[position_key]['count'] += 1
-                                    pyramid_details[position_key]['entries'].append({
-                                        'price': current_price,
-                                        'added_size_usd': increase_size_usd,
-                                        'quantity': increase_qty,
-                                        'time': time.time()
-                                    })
-                            else:
-                                logger.error(f"Failed to place increase order for {symbol}")
-                    else:
-                        logger.info(f"Not increasing {position_type.upper()} {symbol}: Already at maximum size (${position_size_usd:.2f})")
-                
-                # --- POSITION REDUCTION/HEDGE LOGIC BASED ON 2% RULE FROM EXTREMES ---
-                if position_type == 'long':
-                    # For longs: Calculate the highest price reached based on max profit
-                    # Convert max_profit_pct from leveraged to raw price change
-                    raw_price_gain_pct = max_profit_pct / leverage
-                    implied_highest_price = entry_price * (1 + raw_price_gain_pct/100)
-                    
-                    # Calculate exact 2% drop threshold from the implied highest price
-                    REDUCTION_THRESHOLD_PCT = 2.0  # Exactly 2% below highest
-                    reduction_threshold = implied_highest_price * (1 - REDUCTION_THRESHOLD_PCT/100)
-                    
-                    # Calculate current drop from highest
-                    if implied_highest_price > 0:
-                        drop_from_high_pct = ((implied_highest_price - current_price) / implied_highest_price) * 100
-                    else:
-                        drop_from_high_pct = 0
-                    
-                    # Log detailed information about the reduction check
-                    # logger.info(f"LONG REDUCTION CHECK {symbol}: Current={current_price:.6f}, Entry={entry_price:.6f}, " +
-                    #            f"Max Profit={max_profit_pct:.2f}%, Implied High={implied_highest_price:.6f}, " +
-                    #            f"Drop from High={drop_from_high_pct:.2f}%, 2% Threshold={reduction_threshold:.6f}")
-                    
-                    # STRICT RULE: Reduce long if price is 2% or more below the highest price
-                    reduce_position = (current_price <= reduction_threshold) and (drop_from_high_pct >= REDUCTION_THRESHOLD_PCT)
-                    
-                    if reduce_position and position_size_usd > BASE_AMOUNT_USD/2:
-                        # Clear reduction notification
-                        logger.info(f"REDUCING LONG {symbol}: Price {current_price:.6f} is {drop_from_high_pct:.2f}% below " +
-                                   f"high of {implied_highest_price:.6f}")
-                        
-                        # Calculate reduction amount (BASE_AMOUNT_USD or remaining to min viable size)
-                        # min_viable_size = BASE_AMOUNT_USD / 2
                         reduction_size_usd = BASE_AMOUNT_USD
+                        reduction_qty = get_order_quantity(exchange, symbol, current_price, leverage, reduction_size_usd)
+                        reduction_qty = min(reduction_qty, quantity)
                         
-                        if reduction_size_usd > 0:
-                            # Calculate quantity to reduce
-                            reduction_qty = get_order_quantity(
-                                exchange, symbol, current_price, leverage, reduction_size_usd
+                        if reduction_qty > 0:
+                            exit_side = 'buy' if position_type == 'short' else 'sell'
+                            # FIXED: Use reduceOnly=True for reducing positions
+                            reduce_order = place_order(
+                                exchange, symbol, exit_side, reduction_qty, current_price,
+                                reduceOnly=True, positionSide=position_side if ENABLE_HEDGE_MODE else None
                             )
                             
-                            # Safety check for quantity
-                            max_reduction_qty = quantity  # 95% of total to avoid errors
-                            reduction_qty = min(reduction_qty, max_reduction_qty)
-                            
-                            if reduction_qty > 0:
-                                # Place reduce-only order
-                                reduce_order = place_order(
-                                    exchange, symbol, 'sell', reduction_qty, current_price,
-                                    reduceOnly=False, positionSide=position_side if ENABLE_HEDGE_MODE else None
-                                )
-                                
-                                if reduce_order:
-                                    logger.info(f"SUCCESS: Reduced LONG {symbol} by {reduction_qty:.8f} (${reduction_size_usd:.2f})")
-                                    
-                                    # Refresh position data
-                                    refreshed_positions = fetch_open_positions(exchange)
-                                    if position_key in refreshed_positions:
-                                        # Update local variables
-                                        position_info = refreshed_positions[position_key]
-                                        quantity = position_info['quantity']
-                                        position_size_usd = position_info['position_size_usd']
-                                    else:
-                                        logger.info(f"Position {symbol} fully closed after reduction")
-                                        continue
-                                else:
-                                    logger.error(f"Failed to place reduction order for LONG {symbol}")
+                            if reduce_order:
+                                logger.info(f"SUCCESS: Reduced {position_type.upper()} {symbol} by {reduction_qty:.8f} (${reduction_size_usd:.2f})")
                             else:
-                                logger.warning(f"Invalid reduction quantity {reduction_qty:.8f} for {symbol}")
-                        else:
-                            logger.info(f"Skipping reduction for LONG {symbol}: Reduction size ${reduction_size_usd:.2f} too small")
-                        
-                        # HEDGE LOGIC - Open SHORT position when reducing LONG
-                        if ENABLE_HEDGE_MODE:
-                            # Check if short position already exists
-                            short_key = f"{symbol}_SHORT" if ENABLE_HEDGE_MODE else symbol
-                            has_short = False
-                            short_position_size = 0
-                            
-                            # Re-fetch fresh positions to be safe
-                            current_positions = fetch_open_positions(exchange)
-                            for pos_key, pos in current_positions.items():
-                                if pos['symbol'] == symbol and pos['position_type'] == 'short':
-                                    has_short = True
-                                    short_position_size = pos['position_size_usd']
-                                    break
-                            
-                            # Calculate potential new hedge size
-                            potential_hedge_size = BASE_AMOUNT_USD
-                            
-                            # Ensure not exceeding MAX_AMOUNT_USD
-                            if short_position_size + potential_hedge_size > MAX_AMOUNT_USD:
-                                potential_hedge_size = max(0, MAX_AMOUNT_USD - short_position_size)
-                            
-                            # If we don't have a short or it's not at maximum size
-                            if (not has_short or short_position_size < MAX_AMOUNT_USD) and potential_hedge_size > 0:
-                                hedge_size = potential_hedge_size
-                                hedge_qty = get_order_quantity(exchange, symbol, current_price, leverage, hedge_size)
-                                
-                                if hedge_qty > 0:
-                                    logger.info(f"OPENING HEDGE SHORT for {symbol} at {current_price:.6f} with ${hedge_size:.2f}")
-                                    
-                                    # Place hedge order
-                                    hedge_order = place_order(
-                                        exchange, symbol, 'sell', hedge_qty, current_price,
-                                        leverage=leverage, positionSide='SHORT'
-                                    )
-                                    
-                                    if hedge_order:
-                                        logger.info(f"SUCCESS: Opened SHORT {symbol} hedge with ${hedge_size:.2f}")
-                                        
-                                        # Initialize tracking for new hedge position
-                                        hedge_position_key = f"{symbol}_SHORT" if ENABLE_HEDGE_MODE else symbol
-                                        
-                                        with max_profit_lock:
-                                            max_profit_tracking[hedge_position_key] = 0
-                                        with pyramid_lock:
-                                            pyramid_details[hedge_position_key] = {'count': 0, 'entries': []}
-                                        with cooldown_lock:
-                                            position_entry_times[hedge_position_key] = time.time()
-                                    else:
-                                        logger.error(f"Failed to place SHORT hedge order for {symbol}")
-                            else:
-                                logger.info(f"Skipping SHORT hedge for {symbol}: Already exists or at max size")
+                                logger.error(f"Failed to place reduction order for {position_type.upper()} {symbol}")
                 
-                elif position_type == 'short':
-                    # For shorts: Calculate the lowest price reached based on max profit
-                    # Convert max_profit_pct from leveraged to raw price change
-                    raw_price_drop_pct = max_profit_pct / leverage
-                    implied_lowest_price = entry_price * (1 - raw_price_drop_pct/100)
-                    
-                    # Calculate exact 2% rise threshold from the implied lowest price
-                    REDUCTION_THRESHOLD_PCT = 2.0  # Exactly 2% above lowest
-                    reduction_threshold = implied_lowest_price * (1 + REDUCTION_THRESHOLD_PCT/100)
-                    
-                    # Calculate current rise from lowest
-                    if implied_lowest_price > 0:
-                        rise_from_low_pct = ((current_price - implied_lowest_price) / implied_lowest_price) * 100
-                    else:
-                        rise_from_low_pct = 0
-                    
-                    # Log detailed information about the reduction check
-                    # logger.info(f"SHORT REDUCTION CHECK {symbol}: Current={current_price:.6f}, Entry={entry_price:.6f}, " +
-                    #            f"Max Profit={max_profit_pct:.2f}%, Implied Low={implied_lowest_price:.6f}, " +
-                    #            f"Rise from Low={rise_from_low_pct:.2f}%, 2% Threshold={reduction_threshold:.6f}")
-                    
-                    # STRICT RULE: Reduce short if price is 2% or more above the lowest price
-                    reduce_position = (current_price >= reduction_threshold) and (rise_from_low_pct >= REDUCTION_THRESHOLD_PCT)
-                    
-                    if reduce_position and position_size_usd > BASE_AMOUNT_USD/2:
-                        # Clear reduction notification
-                        logger.info(f"REDUCING SHORT {symbol}: Price {current_price:.6f} is {rise_from_low_pct:.2f}% above " +
-                                   f"low of {implied_lowest_price:.6f}")
-                        
-                        # Calculate reduction amount (BASE_AMOUNT_USD or remaining to min viable size)
-                        min_viable_size = BASE_AMOUNT_USD / 2
-                        reduction_size_usd = BASE_AMOUNT_USD
-                        
-                        if reduction_size_usd > 0:
-                            # Calculate quantity to reduce
-                            reduction_qty = get_order_quantity(
-                                exchange, symbol, current_price, leverage, reduction_size_usd
-                            )
-                            
-                            # Safety check for quantity
-                            max_reduction_qty = quantity * 0.95  # 95% of total to avoid errors
-                            reduction_qty = min(reduction_qty, max_reduction_qty)
-                            
-                            if reduction_qty > 0:
-                                # Place reduce-only order
-                                reduce_order = place_order(
-                                    exchange, symbol, 'buy', reduction_qty, current_price,
-                                    reduceOnly=False, positionSide=position_side if ENABLE_HEDGE_MODE else None
-                                )
-                                
-                                if reduce_order:
-                                    logger.info(f"SUCCESS: Reduced SHORT {symbol} by {reduction_qty:.8f} (${reduction_size_usd:.2f})")
-                                    
-                                    # Refresh position data
-                                    refreshed_positions = fetch_open_positions(exchange)
-                                    if position_key in refreshed_positions:
-                                        # Update local variables
-                                        position_info = refreshed_positions[position_key]
-                                        quantity = position_info['quantity']
-                                        position_size_usd = position_info['position_size_usd']
-                                    else:
-                                        logger.info(f"Position {symbol} fully closed after reduction")
-                                        continue
-                                else:
-                                    logger.error(f"Failed to place reduction order for SHORT {symbol}")
-                            else:
-                                logger.warning(f"Invalid reduction quantity {reduction_qty:.8f} for {symbol}")
-                        else:
-                            logger.info(f"Skipping reduction for SHORT {symbol}: Reduction size ${reduction_size_usd:.2f} too small")
-                        
-                        # HEDGE LOGIC - Open LONG position when reducing SHORT
-                        if ENABLE_HEDGE_MODE:
-                            # Check if long position already exists
-                            long_key = f"{symbol}_LONG" if ENABLE_HEDGE_MODE else symbol
-                            has_long = False
-                            long_position_size = 0
-                            
-                            # Re-fetch fresh positions to be safe
-                            current_positions = fetch_open_positions(exchange)
-                            for pos_key, pos in current_positions.items():
-                                if pos['symbol'] == symbol and pos['position_type'] == 'long':
-                                    has_long = True
-                                    long_position_size = pos['position_size_usd']
-                                    break
-                            
-                            # Calculate potential new hedge size
-                            potential_hedge_size = BASE_AMOUNT_USD
-                            
-                            # Ensure not exceeding MAX_AMOUNT_USD
-                            if long_position_size + potential_hedge_size > MAX_AMOUNT_USD:
-                                potential_hedge_size = max(0, MAX_AMOUNT_USD - long_position_size)
-                            
-                            # If we don't have a long or it's not at maximum size
-                            if (not has_long or long_position_size < MAX_AMOUNT_USD) and potential_hedge_size > 0:
-                                hedge_size = potential_hedge_size
-                                hedge_qty = get_order_quantity(exchange, symbol, current_price, leverage, hedge_size)
-                                
-                                if hedge_qty > 0:
-                                    logger.info(f"OPENING HEDGE LONG for {symbol} at {current_price:.6f} with ${hedge_size:.2f}")
-                                    
-                                    # Place hedge order
-                                    hedge_order = place_order(
-                                        exchange, symbol, 'buy', hedge_qty, current_price,
-                                        leverage=leverage, positionSide='LONG'
-                                    )
-                                    
-                                    if hedge_order:
-                                        logger.info(f"SUCCESS: Opened LONG {symbol} hedge with ${hedge_size:.2f}")
-                                        
-                                        # Initialize tracking for new hedge position
-                                        hedge_position_key = f"{symbol}_LONG" if ENABLE_HEDGE_MODE else symbol
-                                        
-                                        with max_profit_lock:
-                                            max_profit_tracking[hedge_position_key] = 0
-                                        with pyramid_lock:
-                                            pyramid_details[hedge_position_key] = {'count': 0, 'entries': []}
-                                        with cooldown_lock:
-                                            position_entry_times[hedge_position_key] = time.time()
-                                    else:
-                                        logger.error(f"Failed to place LONG hedge order for {symbol}")
-                            else:
-                                logger.info(f"Skipping LONG hedge for {symbol}: Already exists or at max size")
+                # HEDGE LOGIC (keep existing)
+                should_hedge, hedge_size, hedge_reason = check_for_hedge_opportunity(exchange, symbol, position_info)
                 
-                # Rest of the original function (indicator checks etc.) if needed
-                # ...
+                if should_hedge and hedge_size > 0:
+                    hedge_side = 'buy' if position_type == 'short' else 'sell'
+                    
+                    logger.info(f"HEDGING {symbol} {position_type.upper()}: {hedge_reason}")
+                    
+                    hedge_qty = get_order_quantity(exchange, symbol, current_price, leverage, hedge_size)
+                    
+                    if hedge_qty > 0:
+                        opposite_position_side = 'LONG' if position_type == 'short' else 'SHORT'
+                        
+                        hedge_order = place_order(
+                            exchange,
+                            symbol,
+                            hedge_side,
+                            hedge_qty,
+                            current_price,
+                            leverage=leverage,
+                            positionSide=opposite_position_side if ENABLE_HEDGE_MODE else None
+                        )
+                        
+                        if hedge_order:
+                            logger.info(f"Successfully placed hedge for {symbol} {position_type.upper()} with ${hedge_size:.2f}")
                 
             except KeyError as ke:
-                logger.error(f"KeyError processing position for {position_key}: {ke}. Position data: {position_info}")
+                logger.error(f"KeyError processing position for {position_key}: {ke}")
             except Exception as e:
                 logger.exception(f"Error processing position for {position_key}: {e}")
                 continue
     
     except Exception as e:
         logger.exception(f"Critical error in check_for_position_exits main loop: {e}")
-def calculate_rsi(prices, window=14):
-    """Calculate Relative Strength Index"""
-    delta = prices.diff()
-    delta = delta.dropna()
-    
-    up, down = delta.copy(), delta.copy()
-    up[up < 0] = 0
-    down[down > 0] = 0
-    down = down.abs()
-    
-    avg_gain = up.rolling(window).mean()
-    avg_loss = down.rolling(window).mean()
-    
-    rs = avg_gain / avg_loss
-    rs = rs.replace([np.inf, -np.inf], np.nan).fillna(0)
-    
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def log_trade_metrics(reason, increment=True):
-    """Increment metrics on trade filtering (console only, no file writing)."""
-    global global_metrics
-    
-    # Initialize if doesn't exist
-    if 'patterns_detected' not in global_metrics:
-        global_metrics = {
-            'patterns_detected': 0,
-            'patterns_below_threshold': 0,
-            'insufficient_tf_confirmation': 0,
-            'failed_sequence_check': 0,
-            'failed_reversal_check': 0,
-            'failed_risk_reward': 0,
-            'failed_proximity_check': 0,
-            'order_placement_errors': 0,
-            'successful_entries': 0,
-            'last_reset': time.time()
-        }
-    
-    # Increment the appropriate counter
-    if increment and reason in global_metrics:
-        global_metrics[reason] += 1
-    
-    # Reset metrics periodically (every 24 hours)
-    current_time = time.time()
-    if current_time - global_metrics.get('last_reset', 0) > 86400:
-        # Reset all counters except last_reset
-        for key in global_metrics:
-            if key != 'last_reset':
-                global_metrics[key] = 0
-        global_metrics['last_reset'] = current_time
-        logger.info("Trade metrics reset")
 
 def calculate_position_size(symbol, base_size=BASE_AMOUNT_USD, max_size=MAX_AMOUNT_USD, increment=AMOUNT_INCREMENT):
     """
@@ -1741,29 +1786,100 @@ def get_order_quantity(exchange, market_id, price, leverage, position_size=None)
         return 0.0
 
 def place_order(exchange, market_id, side, quantity, price, leverage=None, reduceOnly=False, positionSide=None):
-    """Enhanced order placement function that supports hedge mode."""
+    """Enhanced order placement function with proper Binance hedge mode handling."""
     params = {}
     
-    # FIXED: Strip position side suffix (_LONG or _SHORT) from market_id if present
-    if isinstance(market_id, str) and ('_LONG' in market_id or '_SHORT' in market_id):
-        # Extract the base symbol by removing the position side suffix
-        base_market_id = market_id.split('_')[0]
-        logger.info(f"Stripped position side suffix from market ID: {market_id} -> {base_market_id}")
-        market_id = base_market_id
+    # Ensure we're using a clean market_id without position suffixes
+    if isinstance(market_id, str):
+        if '_LONG' in market_id:
+            market_id = market_id.split('_LONG')[0]
+        elif '_SHORT' in market_id:
+            market_id = market_id.split('_SHORT')[0]
     
-    # Add reduceOnly parameter if specified
-    if reduceOnly:
-        params['reduceOnly'] = True
-
-    # Add positionSide for hedge mode if specified
+    # Handle hedge mode and positionSide
     if ENABLE_HEDGE_MODE:
-        # If positionSide not explicitly provided, set default based on side
+        # In hedge mode, we need positionSide but NOT reduceOnly
         if not positionSide:
             positionSide = 'LONG' if side == 'buy' else 'SHORT'
         params['positionSide'] = positionSide
+        
+        # CRITICAL: Do NOT add reduceOnly in hedge mode
+        # Binance automatically understands we're targeting a specific position
+        # when positionSide is specified
+        
+    else:
+        # In one-way mode, we can use reduceOnly but NOT positionSide
+        if reduceOnly:
+            params['reduceOnly'] = True
+        # positionSide is not allowed in one-way mode
 
     try:
-        # First, ensure hedge mode is enabled
+        # Skip MAX_AMOUNT_USD check for reduction orders
+        if not reduceOnly:  # Only check for new positions or increasing existing ones
+            # Get current positions
+            open_positions = fetch_open_positions(exchange)
+            
+            # Calculate current exposure for this symbol
+            current_exposure = 0
+            position_key = market_id
+            
+            # In hedge mode, use position-specific key
+            if ENABLE_HEDGE_MODE and positionSide:
+                position_key = f"{market_id}_{positionSide}"
+                
+            # Check if we already have a position
+            if position_key in open_positions:
+                current_exposure = open_positions[position_key]['position_size_usd']
+            
+            # Calculate order size in USD
+            ticker_data = exchange.fetch_ticker(market_id)
+            order_price = ticker_data['last']
+            order_notional = quantity * order_price
+            
+            # With leverage, the position size is notional / leverage
+            if leverage:
+                order_size_usd = order_notional / leverage
+            else:
+                # Try to get leverage from existing position
+                if position_key in open_positions:
+                    leverage_value = open_positions[position_key]['leverage']
+                    order_size_usd = order_notional / leverage_value
+                else:
+                    # Default to 10x leverage if not specified
+                    order_size_usd = order_notional / 10
+            
+            # Calculate total position size after this order
+            total_size_after_order = current_exposure + order_size_usd
+            
+            # Check if it would exceed MAX_AMOUNT_USD
+            if total_size_after_order > MAX_AMOUNT_USD:
+                logger.warning(f"Order for {market_id} would exceed MAX_AMOUNT_USD (${MAX_AMOUNT_USD}). " +
+                             f"Current: ${current_exposure:.2f}, Adding: ${order_size_usd:.2f}, " +
+                             f"Total: ${total_size_after_order:.2f}")
+                
+                # Adjust the quantity to respect the maximum
+                if current_exposure < MAX_AMOUNT_USD:
+                    allowed_addition = MAX_AMOUNT_USD - current_exposure
+                    adjusted_quantity = (allowed_addition * leverage) / order_price
+                    
+                    # Only proceed if the adjusted quantity is meaningful
+                    if adjusted_quantity > 0:
+                        logger.info(f"Adjusting order quantity from {quantity:.8f} to {adjusted_quantity:.8f} " +
+                                  f"to respect MAX_AMOUNT_USD (${MAX_AMOUNT_USD})")
+                        quantity = adjusted_quantity
+                    else:
+                        logger.error(f"Cannot place order: Position size ${current_exposure:.2f} " +
+                                   f"already at or near maximum ${MAX_AMOUNT_USD:.2f}")
+                        return None
+                else:
+                    logger.error(f"Cannot place order: Position size ${current_exposure:.2f} " +
+                               f"already exceeds maximum ${MAX_AMOUNT_USD:.2f}")
+                    return None
+        else:
+            # For reduction orders, log that we're bypassing the check
+            logger.debug(f"Bypassing MAX_AMOUNT_USD check for reduction order: {market_id} {side} {quantity:.8f}")
+
+        # Proceed with hedge mode and margin mode checks
         if ENABLE_HEDGE_MODE:
             try:
                 account_info = exchange.fapiPrivateGetAccount()
@@ -1775,7 +1891,7 @@ def place_order(exchange, market_id, side, quantity, price, leverage=None, reduc
             except Exception as e:
                 logger.warning(f"Error checking/setting hedge mode: {e}")
         
-        # Ensure isolated margin mode (unchanged)
+        # Ensure isolated margin mode
         try:
             position_info = exchange.fetch_positions([market_id])
             if position_info and len(position_info) > 0:
@@ -1793,27 +1909,33 @@ def place_order(exchange, market_id, side, quantity, price, leverage=None, reduc
         ticker_data = exchange.fetch_ticker(market_id)
         latest_market_price = ticker_data['last']
         
-        # Log order details with hedge mode info
-        hedge_info = f" (positionSide: {positionSide})" if ENABLE_HEDGE_MODE else ""
-        logger.info(f"Placing {side.upper()} order for {market_id} - Qty: {quantity:.8f} at ~{latest_market_price:.6f}, reduceOnly: {reduceOnly}{hedge_info}")
+        # Log order details
+        mode_info = f" (positionSide: {positionSide})" if ENABLE_HEDGE_MODE else f" (reduceOnly: {reduceOnly})"
+        logger.info(f"Placing {side.upper()} order for {market_id} - Qty: {quantity:.8f} at ~{latest_market_price:.6f}{mode_info}")
         
         # Place market order
         try:
             market_order = exchange.create_order(market_id, 'MARKET', side, quantity, params=params)
         except ccxt.InvalidOrder as e:
-            if 'ReduceOnly Order is rejected' in str(e) and reduceOnly:
-                logger.warning(f"ReduceOnly order rejected for {market_id}. Attempting without reduceOnly parameter.")
+            error_msg = str(e)
+            
+            # Handle various Binance errors
+            if 'ReduceOnly Order is rejected' in error_msg and 'reduceOnly' in params:
+                logger.warning(f"ReduceOnly order rejected for {market_id}. Retrying without reduceOnly parameter.")
+                params.pop('reduceOnly', None)
+                market_order = exchange.create_order(market_id, 'MARKET', side, quantity, params=params)
+            elif 'Parameter \'reduceonly\' sent when not required' in error_msg:
+                logger.warning(f"reduceOnly parameter not required for {market_id}. Retrying without it.")
                 params.pop('reduceOnly', None)
                 market_order = exchange.create_order(market_id, 'MARKET', side, quantity, params=params)
             else:
                 raise
         
         # Log success
-        logger.info(f"Order successfully placed for {market_id}: {side.upper()} {quantity:.8f} @ {latest_market_price:.6f}, ID: {market_order.get('id', 'N/A')}{hedge_info}")
+        logger.info(f"Order successfully placed for {market_id}: {side.upper()} {quantity:.8f} @ {latest_market_price:.6f}, ID: {market_order.get('id', 'N/A')}")
         
         # Record entry time if not reducing
         if not reduceOnly:
-            # Use appropriate position key format in hedge mode
             position_key = market_id
             if ENABLE_HEDGE_MODE and positionSide:
                 position_key = f"{market_id}_{positionSide}"
@@ -1858,18 +1980,60 @@ def check_for_hedged_position(open_positions, symbol, position_side=None):
                 return True, position
     
     return False, None
+def calculate_volatility_adjusted_tp(exchange, symbol, position_type, entry_price):
+    """Calculate volatility-adjusted take-profit level."""
+    try:
+        # Get price data
+        df = fetch_extended_historical_data(exchange, symbol, TIMEFRAME)
+        if df is None or len(df) < 20:
+            # Default to standard 20% if insufficient data
+            return entry_price * (1.2 if position_type == 'long' else 0.8)
+            
+        # Calculate 20-period rolling volatility (standard deviation of returns)
+        returns = df['close'].pct_change().iloc[-20:].dropna().values
+        volatility = np.std(returns) * 100  # Convert to percentage
+        
+        # Adjust for timeframe - scale up for smaller timeframes
+        if TIMEFRAME == '1m':
+            volatility = volatility * 2
+        elif TIMEFRAME == '3m':
+            volatility = volatility * 1.5
+            
+        # Apply multiplier to volatility to get TP percentage
+        k = 1.5  # Multiplier
+        tp_pct = volatility * k
+        
+        # Clamp TP percentage between 5% and 30%
+        tp_pct = max(5.0, min(30.0, tp_pct))
+        
+        logger.info(f"Volatility for {symbol}: {volatility:.2f}%, Adjusted TP: {tp_pct:.2f}%")
+        
+        # Calculate target price based on position type and entry price
+        if position_type == 'long':
+            target_price = entry_price * (1 + tp_pct/100)
+        else:  # short
+            target_price = entry_price * (1 - tp_pct/100)
+            
+        return target_price
+        
+    except Exception as e:
+        logger.error(f"Error calculating volatility-adjusted TP: {e}")
+        # Default to standard 20% on error
+        return entry_price * (1.2 if position_type == 'long' else 0.8)
 def place_tp_only_order(exchange, market_id, entry_side, quantity, leverage=10, retries=2):
     """
-    Place a take-profit order with a fixed 20% price change profit target.
-    Enhanced with proper hedge mode support.
+    Place a take-profit order with risk-optimized profit target.
+    Implements the framework rule: Target Reward ≥ 2 × Risk per Layer
     """
     try:
-        # FIXED: Strip position side suffix (_LONG or _SHORT) from market_id if present
-        if isinstance(market_id, str) and ('_LONG' in market_id or '_SHORT' in market_id):
-            # Extract the base symbol by removing the position side suffix
-            base_market_id = market_id.split('_')[0]
-            logger.info(f"Stripped position side suffix from market ID: {market_id} -> {base_market_id}")
-            market_id = base_market_id
+        # Clean up market_id if it has position suffix
+        if isinstance(market_id, str):
+            if '_LONG' in market_id:
+                market_id = market_id.split('_LONG')[0]
+                logger.info(f"Cleaned up market ID: {market_id}")
+            elif '_SHORT' in market_id:
+                market_id = market_id.split('_SHORT')[0]
+                logger.info(f"Cleaned up market ID: {market_id}")
             
         # Get position information from exchange
         open_positions = fetch_open_positions(exchange)
@@ -1898,27 +2062,44 @@ def place_tp_only_order(exchange, market_id, entry_side, quantity, leverage=10, 
             
         logger.info(f"Setting TP for {market_id} with entry price: {entry_price}")
         
-        # Calculate target price with EXACTLY 20% price change
-        if entry_side == 'buy':  # LONG
-            target_price = entry_price * 1.20  # Fixed 20% price increase
-        else:  # SHORT
-            target_price = entry_price * 0.80  # Fixed 20% price decrease
+        # Determine position type and get stop loss
+        position_type = 'long' if entry_side == 'buy' else 'short'
+        
+        # Get indicator to determine stop loss
+        indicator = get_momentum_indicator(market_id, exchange)
+        df = fetch_extended_historical_data(exchange, market_id, MOMENTUM_TIMEFRAME)
+        
+        # Calculate stop loss
+        if indicator and df is not None and len(df) > 20:
+            stop_loss = indicator.determine_stop_loss(df, position_type=position_type, entry_price=entry_price)
+        else:
+            # Fallback calculation if indicator not available
+            stop_loss = entry_price * (1 - 0.06/leverage if position_type == 'long' else 1 + 0.06/leverage)
+        
+        # FRAMEWORK IMPLEMENTATION: Calculate risk-optimized target
+        target_price = calculate_risk_optimized_tp(
+            exchange, market_id, position_type, entry_price, stop_loss
+        )
         
         # Ensure formatting is correct
         formatted_entry = float(f"{entry_price:.6f}")
         formatted_target = float(f"{target_price:.6f}")
         
         # Verify calculation
-        if entry_side == 'buy':
+        if position_type == 'long':
             actual_pct = ((formatted_target - formatted_entry) / formatted_entry) * 100
+            risk = entry_price - stop_loss
+            reward = target_price - entry_price
         else:
             actual_pct = ((formatted_entry - formatted_target) / formatted_entry) * 100
-            
-        logger.info(f"TP target for {market_id}: {formatted_target} ({actual_pct:.2f}% price change from entry {formatted_entry})")
+            risk = stop_loss - entry_price
+            reward = entry_price - target_price
         
-        # Sanity check
-        if abs(actual_pct - 20.0) > 0.5:
-            logger.warning(f"TP calculation error! Target {actual_pct:.2f}% is not 20% from entry")
+        # Calculate risk-reward ratio
+        risk_reward_ratio = reward / risk if risk > 0 else 0
+            
+        logger.info(f"Risk-optimized TP target for {market_id}: {formatted_target} ({actual_pct:.2f}% price change, " +
+                    f"Risk-Reward {risk_reward_ratio:.2f}:1)")
     
     except Exception as e:
         logger.warning(f"Error calculating TP price for {market_id}: {e}")
@@ -1946,14 +2127,14 @@ def place_tp_only_order(exchange, market_id, entry_side, quantity, leverage=10, 
             tp_params['reduceOnly'] = True
             hedge_info = ""
         
-        logger.info(f"Placing TP Order (EXACTLY 20% price change) for {market_id}: {inverted_side.upper()} "
-                   f"Qty:{quantity:.8f} @ Stop:{tp_params['stopPrice']}{hedge_info}")
+        logger.info(f"Placing Risk-Optimized TP Order for {market_id}: {inverted_side.upper()} "
+                   f"Qty:{quantity:.8f} @ Stop:{tp_params['stopPrice']}{hedge_info} (Risk-Reward {risk_reward_ratio:.2f}:1)")
         
         tp_order = exchange.create_order(
             market_id, 'TAKE_PROFIT_MARKET', inverted_side, quantity, None, params=tp_params
         )
         
-        logger.info(f"TP order {tp_order.get('id', 'N/A')} placed for {market_id} at {tp_params['stopPrice']} (20% price change target)")
+        logger.info(f"TP order {tp_order.get('id', 'N/A')} placed for {market_id} at {tp_params['stopPrice']}")
                 
         return True
 
@@ -1966,7 +2147,6 @@ def place_tp_only_order(exchange, market_id, entry_side, quantity, leverage=10, 
         else:
             logger.error(f"Failed to place TP order for {market_id} after all retry attempts: {e}")
             return False
-
 def handle_position_reversal(exchange, symbol, reversal_strength, current_position_type, profit_pct=0):
     """
     Handle position reversal using exchange data instead of position_details.
@@ -2128,15 +2308,17 @@ def sync_positions_with_exchange(exchange):
 
 def momentum_trading_loop(exchange):
     """
-    Enhanced momentum trading loop relying on exchange as the source of truth.
-    Modified to only count SHORT positions against MAX_OPEN_TRADES limit.
+    Enhanced momentum trading loop implementing the mathematical framework.
+    - Validates entries with minimum risk-reward of 2:1
+    - Uses pyramid sizing based on Pₙ = Pₙ₋₁ × 0.5
+    - Implements dynamic hedging based on retracement
     """
     while True:
         try:
             # Sync positions with exchange
             sync_positions_with_exchange(exchange)
             
-            # Check for position exits including reversals
+            # Check for position exits including hedging and reversals
             check_for_position_exits(exchange)
             
             # Check for pyramid opportunities
@@ -2151,8 +2333,6 @@ def momentum_trading_loop(exchange):
             
             # Check if we can look for new SHORT entries
             if len(short_positions) >= MAX_OPEN_TRADES:
-                logger.info(f"At maximum number of SHORT trades ({len(short_positions)}/{MAX_OPEN_TRADES}). "
-                           f"Skipping new SHORT entries. Total positions: {len(open_positions)}.")
                 time.sleep(SLEEP_INTERVAL * 3)
                 continue  # Skip to next loop iteration, don't look for new entries
             
@@ -2204,11 +2384,22 @@ def momentum_trading_loop(exchange):
                     # Look for valid SHORT signals only
                     if signal['signal'] == 'sell':
                         current_price = signal['price']
-                        has_kama_crossunder = signal.get('has_kama_crossunder', False)
-                        crossunder_age = signal.get('crossunder_age', 0)
-                        minutes_ago = signal.get('crossunder_minutes_ago', 0)
+                        stop_loss = signal['stop_loss']
                         
-                        logger.info(f"MOMENTUM SHORT SIGNAL: {symbol} - {signal['reason']}")
+                        # FRAMEWORK IMPLEMENTATION: Check risk-reward ratio
+                        target_price = calculate_risk_optimized_tp(
+                            exchange, symbol, 'short', current_price, stop_loss
+                        )
+                        
+                        meets_requirement, actual_ratio = check_risk_reward_ratio(
+                            current_price, stop_loss, target_price, 'short', min_ratio=2.0
+                        )
+                        
+                        if not meets_requirement:
+                            logger.info(f"Skipping {symbol} SHORT: Risk-reward ratio ({actual_ratio:.2f}) below minimum requirement (2.0)")
+                            continue
+                        
+                        logger.info(f"MOMENTUM SHORT SIGNAL: {symbol} - {signal['reason']} with R:R {actual_ratio:.2f}")
                         
                         # Calculate position size based on performance history
                         position_size = calculate_position_size(symbol)
@@ -2234,7 +2425,7 @@ def momentum_trading_loop(exchange):
                             
                         logger.info(f"Placing momentum short for {symbol} at {current_price} "
                                  f"with position size ${position_size} and {leverage}x leverage "
-                                 f"(crossunder was {crossunder_age} candles / {minutes_ago} minutes ago)")
+                                 f"(Risk-Reward: {actual_ratio:.2f}:1)")
                         
                         order = place_order(
                                 exchange, 
@@ -2253,7 +2444,7 @@ def momentum_trading_loop(exchange):
                             with cooldown_lock:
                                 position_entry_times[symbol] = time.time()
                             
-                            # Place only TP order (not SL since we use dynamic management)
+                            # Place risk-optimized TP order
                             place_tp_only_order(
                                 exchange, 
                                 symbol, 
@@ -2302,6 +2493,21 @@ def momentum_trading_loop(exchange):
                     for symbol, signal in long_signals.items():
                         try:
                             current_price = signal['price']
+                            stop_loss = signal['stop_loss']
+                            
+                            # FRAMEWORK IMPLEMENTATION: Check risk-reward ratio
+                            target_price = calculate_risk_optimized_tp(
+                                exchange, symbol, 'long', current_price, stop_loss
+                            )
+                            
+                            meets_requirement, actual_ratio = check_risk_reward_ratio(
+                                current_price, stop_loss, target_price, 'long', min_ratio=2.0
+                            )
+                            
+                            if not meets_requirement:
+                                logger.info(f"Skipping {symbol} LONG: Risk-reward ratio ({actual_ratio:.2f}) below minimum requirement (2.0)")
+                                continue
+                            
                             position_size = calculate_position_size(symbol)
                             
                             leverage = get_leverage_for_market(exchange, symbol)
@@ -2312,9 +2518,7 @@ def momentum_trading_loop(exchange):
                             if quantity <= 0:
                                 continue
                                 
-                            stop_loss = signal['stop_loss']
-                            
-                            logger.info(f"MOMENTUM LONG SIGNAL: {symbol} - {signal['reason']}")
+                            logger.info(f"MOMENTUM LONG SIGNAL: {symbol} - {signal['reason']} with R:R {actual_ratio:.2f}")
                             
                             # Initialize tracking for max profit
                             with max_profit_lock:
@@ -2341,7 +2545,7 @@ def momentum_trading_loop(exchange):
                                 with cooldown_lock:
                                     position_entry_times[symbol] = time.time()
                                 
-                                # Place only TP order for this position
+                                # Place risk-optimized TP order
                                 place_tp_only_order(
                                     exchange, 
                                     symbol, 

@@ -1040,7 +1040,7 @@ class MomentumShortIndicator:
                 'crossunder_age': crossunder_age,
                 'crossunder_minutes_ago': minutes_ago_crossunder,
                 'is_below_kama': is_below_kama,
-                'supertrend_bearish_met': True
+                'supertrend_bearish_met': is_supertrend_bearish
             }
             
             # Next, check for long signal conditions
@@ -1068,7 +1068,7 @@ class MomentumShortIndicator:
                 'crossover_age': crossover_age,
                 'crossover_minutes_ago': minutes_ago_crossover,
                 'is_above_kama': is_above_kama,
-                'supertrend_bullish_met': True
+                'supertrend_bullish_met': is_supertrend_bullish
             }
             
             # Calculate drawdown/recovery for both scenarios
@@ -1085,8 +1085,7 @@ class MomentumShortIndicator:
                 long_conditions_met['recovery_pct'] = recovery_pct
             
             # Generate SHORT signal - REMOVED first crossunder requirement
-            if (has_price_gain and has_kama_crossunder and is_recent_crossunder 
-                and is_below_kama):
+            if (has_price_gain and is_supertrend_bearish and is_below_kama):
                 
                 # Add this check: Skip trades that have already retraced too much of their gain
                 drawdown_to_gain_ratio = short_conditions_met.get('drawdown_to_gain_ratio', 0)
@@ -1144,7 +1143,7 @@ class MomentumShortIndicator:
                 return signal
             
             # ENHANCEMENT: Generate LONG signal as well
-            if (has_price_decrease and has_kama_crossover and is_recent_crossover 
+            if (has_price_decrease and has_kama_crossover 
                 and is_above_kama and is_supertrend_bullish):
                 
                 recovery_pct = long_conditions_met.get('recovery_pct', 0)
