@@ -1070,29 +1070,28 @@ def check_for_position_exits(exchange):
                     # For SHORT: Find lowest price since entry
                     lowest_price = df_since_entry['low'].min()
                     
-                    # Calculate 3% above the low
-                    retracement_threshold = lowest_price * 1.03
+                    # Calculate 5% above the low
+                    retracement_threshold = lowest_price * 1.05
                     
                     # Current retracement percentage
                     retracement_pct = ((current_price - lowest_price) / lowest_price) * 100
-                    
-                    # Check if current price is above threshold (3% retracement)
-                    if current_price >= retracement_threshold and retracement_pct >= 3.0:
+                    # Check if current price is above threshold (5% retracement)
+                    if current_price >= retracement_threshold and retracement_pct >= 5.0:
                         reduce_position = True
                         reduction_reason = f"Price {current_price:.6f} retraced {retracement_pct:.2f}% from low {lowest_price:.6f}"
                 
                 elif position_type == 'long':
                     # For LONG: Find highest price since entry
                     highest_price = df_since_entry['high'].max()
-                    
-                    # Calculate 3% below the high
-                    retracement_threshold = highest_price * 0.97
-                    
+
+                    # Calculate 5% below the high
+                    retracement_threshold = highest_price * 0.95
+
                     # Current retracement percentage
                     retracement_pct = ((highest_price - current_price) / highest_price) * 100
-                    
-                    # Check if current price is below threshold (3% retracement)
-                    if current_price <= retracement_threshold and retracement_pct >= 3.0:
+
+                    # Check if current price is below threshold (5% retracement)
+                    if current_price <= retracement_threshold and retracement_pct >= 5.0:
                         reduce_position = True
                         reduction_reason = f"Price {current_price:.6f} retraced {retracement_pct:.2f}% from high {highest_price:.6f}"
                 
@@ -1733,6 +1732,21 @@ def place_order(exchange, market_id, side, quantity, price, leverage=None, reduc
         elif '_SHORT' in market_id:
             market_id = market_id.split('_SHORT')[0]
     
+    # Check MAX_OPEN_TRADES for new positions only (not for exits, pyramids, or hedges)
+    if not reduceOnly:  # Only check for non-reducing orders
+        # Get current positions to check symbol count
+        open_positions = fetch_open_positions(exchange)
+        unique_symbols_with_positions = set()
+        for position_key, position_info in open_positions.items():
+            symbol = position_info['symbol']
+            unique_symbols_with_positions.add(symbol)
+        
+        # Check if this would be a completely new symbol position
+        if market_id not in unique_symbols_with_positions:
+            if len(unique_symbols_with_positions) >= MAX_OPEN_TRADES:
+                logger.warning(f"Blocking new position order for {market_id}: Already at MAX_OPEN_TRADES ({len(unique_symbols_with_positions)}/{MAX_OPEN_TRADES})")
+                return None
+    
     # Handle hedge mode and positionSide
     if ENABLE_HEDGE_MODE:
         # In hedge mode, we need positionSide but NOT reduceOnly
@@ -2272,9 +2286,11 @@ def momentum_trading_loop(exchange):
             # Check if we can look for new entries based on unique symbols
             if len(unique_symbols_with_positions) >= MAX_OPEN_TRADES:
                 logger.info(f"Reached maximum symbols with positions ({len(unique_symbols_with_positions)}/{MAX_OPEN_TRADES}). "
-                          f"Symbols: {list(unique_symbols_with_positions)}")
-                time.sleep(SLEEP_INTERVAL * 3)
-                continue  # Skip to next loop iteration, don't look for new entries
+                          f"Symbols: {list(unique_symbols_with_positions)}. Only monitoring exits and pyramids.")                
+                continue  # Skip entry logic completely, go to next iteration
+            
+            # ENTRY LOGIC - Only executed when below MAX_OPEN_TRADES
+            logger.info(f"Currently trading {len(unique_symbols_with_positions)} symbols: {list(unique_symbols_with_positions)}")
             
             # Find coins with significant price movements
             momentum_candidates = find_momentum_candidates(exchange, sort_type='both', limit=20)
@@ -2291,7 +2307,6 @@ def momentum_trading_loop(exchange):
                 long_candidates = []  # No specific long candidates yet
             
             logger.info(f"Checking {len(short_candidates)} momentum candidates for entry signals...")
-            logger.info(f"Currently trading {len(unique_symbols_with_positions)} symbols: {list(unique_symbols_with_positions)}")
             
             entry_placed = False  # Flag to track if we've placed an entry
             
@@ -2401,8 +2416,8 @@ def momentum_trading_loop(exchange):
                                 unique_symbols_with_positions.add(symbol_name)
                             
                             if len(unique_symbols_with_positions) >= MAX_OPEN_TRADES:
-                                logger.info(f"Reached maximum symbols with positions ({len(unique_symbols_with_positions)}/{MAX_OPEN_TRADES}). "
-                                          f"Stopping entry processing.")
+                                # logger.info(f"Reached maximum symbols with positions ({len(unique_symbols_with_positions)}/{MAX_OPEN_TRADES}). "
+                                #           f"Stopping entry processing.")
                                 break
                             
                             break
@@ -2520,7 +2535,6 @@ def momentum_trading_loop(exchange):
         except Exception as e:
             logger.exception(f"Error in momentum trading loop: {e}")
             time.sleep(SLEEP_INTERVAL * 5)
-
 def main():
     """Main function to start the trading bot without threading locks and caching."""
     exchange = create_exchange()
