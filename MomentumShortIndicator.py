@@ -497,19 +497,6 @@ class MomentumShortIndicator:
         Returns:
             bool: True if the most recent num_candles candles are all above the level
         """
-        # if num_candles is None:
-        #     num_candles = self.exit_sustained_candles
-            
-        # if df is None or len(df) < num_candles:
-        #     return False
-        
-        # # Get just the most recent num_candles
-        # recent_candles = df.iloc[-num_candles:]
-        
-        # # Check if ALL of these candles are above the level
-        # all_above = all(recent_candles['close'] > level)
-        
-        # return all_above
         return True
 
     def check_sustained_below_level(self, df, level, num_candles=None):
@@ -525,19 +512,6 @@ class MomentumShortIndicator:
         Returns:
             bool: True if the most recent num_candles candles are all below the level
         """
-        # if num_candles is None:
-        #     num_candles = self.exit_sustained_candles
-            
-        # if df is None or len(df) < num_candles:
-        #     return False
-        
-        # # Get just the most recent num_candles
-        # recent_candles = df.iloc[-num_candles:]
-        
-        # # Check if ALL of these candles are below the level
-        # all_below = all(recent_candles['close'] < level)
-        
-        # return all_below
         return True
         
     def check_supertrend_bearish(self, df, supertrend_data=None):
@@ -553,7 +527,7 @@ class MomentumShortIndicator:
         supertrend_dir_columns = [col for col in df.columns if col.startswith('SUPERTd_')]
         
         if supertrend_dir_columns:
-            # Use existing SuperTrend column (already calculated in fetch_extended_historical_data)
+            # Use existing SuperTrend column (already calculated in fetch_data_with_indicators)
             direction_col = supertrend_dir_columns[0]
             current_direction = df[direction_col].iloc[-1]
             # Direction -1 means bearish (red)
@@ -599,7 +573,7 @@ class MomentumShortIndicator:
         supertrend_dir_columns = [col for col in df.columns if col.startswith('SUPERTd_')]
         
         if supertrend_dir_columns:
-            # Use existing SuperTrend column (already calculated in fetch_extended_historical_data)
+            # Use existing SuperTrend column (already calculated in fetch_data_with_indicators)
             direction_col = supertrend_dir_columns[0]
             current_direction = df[direction_col].iloc[-1]
             # Direction 1 means bullish (green)
@@ -1040,7 +1014,7 @@ class MomentumShortIndicator:
                 'crossunder_age': crossunder_age,
                 'crossunder_minutes_ago': minutes_ago_crossunder,
                 'is_below_kama': is_below_kama,
-                'supertrend_bearish_met': is_supertrend_bearish
+                'supertrend_bearish_met': True
             }
             
             # Next, check for long signal conditions
@@ -1068,7 +1042,7 @@ class MomentumShortIndicator:
                 'crossover_age': crossover_age,
                 'crossover_minutes_ago': minutes_ago_crossover,
                 'is_above_kama': is_above_kama,
-                'supertrend_bullish_met': is_supertrend_bullish
+                'supertrend_bullish_met': True
             }
             
             # Calculate drawdown/recovery for both scenarios
@@ -1085,7 +1059,8 @@ class MomentumShortIndicator:
                 long_conditions_met['recovery_pct'] = recovery_pct
             
             # Generate SHORT signal - REMOVED first crossunder requirement
-            if (has_price_gain and is_supertrend_bearish and is_below_kama):
+            if (has_price_gain and has_kama_crossunder and is_recent_crossunder 
+                and is_below_kama):
                 
                 # Add this check: Skip trades that have already retraced too much of their gain
                 drawdown_to_gain_ratio = short_conditions_met.get('drawdown_to_gain_ratio', 0)
@@ -1143,7 +1118,7 @@ class MomentumShortIndicator:
                 return signal
             
             # ENHANCEMENT: Generate LONG signal as well
-            if (has_price_decrease and has_kama_crossover 
+            if (has_price_decrease and has_kama_crossover and is_recent_crossover 
                 and is_above_kama and is_supertrend_bullish):
                 
                 recovery_pct = long_conditions_met.get('recovery_pct', 0)
